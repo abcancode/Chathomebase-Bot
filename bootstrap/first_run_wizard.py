@@ -37,6 +37,15 @@ def run_wizard(config_file: Path):
     chb_password = Prompt.ask("ChatHomeBase password", 
                                password=True).strip()
     
+    # Optional: Proxy
+    console.rule("[bold]Proxy (Optional)[/bold]")
+    use_proxy = Confirm.ask("Use proxy?", default=False)
+    proxy = None
+    if use_proxy:
+        proxy_server = Prompt.ask("Proxy server (e.g., http://proxy:8080 or socks5://user:pass@host:port)").strip()
+        if proxy_server:
+            proxy = {"server": proxy_server}
+    
     # Optional: Telegram notifications
     console.rule("[bold]Telegram Notifications (Optional)[/bold]")
     use_telegram = Confirm.ask("Enable Telegram low-balance alerts?", default=False)
@@ -50,7 +59,7 @@ def run_wizard(config_file: Path):
         console.print("Get your user ID from @userinfobot")
         telegram_user_id = Prompt.ask("Telegram user ID").strip()
     
-    # Optional: OpenAI for image vision
+    # Optional: OpenAI for vision
     console.rule("[bold]Image Analysis (Optional)[/bold]")
     use_vision = Confirm.ask("Enable image analysis? (Requires OpenAI API key)", default=False)
     
@@ -65,10 +74,10 @@ def run_wizard(config_file: Path):
         "deepseek_api_key": deepseek_key,
         "chathomebase_login": chb_email,
         "chathomebase_password": chb_password,
+        "proxy": proxy,
         "telegram_bot_token": telegram_token,
         "telegram_user_id": telegram_user_id,
         "openai_api_key": openai_key,
-        "proxy": existing.get("proxy"),
         "deepseek_low_balance_threshold_usd": 4.0,
     }
     
@@ -78,6 +87,8 @@ def run_wizard(config_file: Path):
     
     console.print("\n[green]✓ Setup complete![/green]")
     console.print("[cyan]Player and customer profiles will be auto-scraped from chathomebase.com[/cyan]")
+    if proxy:
+        console.print(f"[yellow]Proxy configured: {proxy['server']}[/yellow]")
     console.print("Run [bold]LAUNCH.bat[/bold] to start the bot.\n")
 
 
