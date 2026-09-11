@@ -3,8 +3,8 @@ cd /d "%~dp0"
 title ChatHomeBase Bot Updater
 
 :: CONFIGURE THESE URLS
-set VERSION_URL=https://raw.githubusercontent.com/YOURNAME/chathomebase-bot/main/version.txt
-set DOWNLOAD_URL=https://github.com/YOURNAME/chathomebase-bot/releases/download/v1.0.0/latest.zip
+set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.0.0/latest.zip
 
 echo =======================================
 echo ChatHomeBase Bot Updater
