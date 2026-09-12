@@ -63,7 +63,7 @@ class ChatHomeBaseAdapter:
             settings.get("player_occupation", "")
         )
         
-        # Telegram - Optional (won't crash if not installed)
+        # Telegram - Optional
         self.telegram_enabled = False
         self.notifier = None
         self.telegram_user_id = None
@@ -75,7 +75,6 @@ class ChatHomeBaseAdapter:
                 self.telegram_enabled = True
             except ImportError:
                 print("[WARNING] telegram_notify not installed. Notifications disabled.")
-                print("To enable: pip install python-telegram-bot")
         
         # OpenAI for vision
         self.openai_enabled = bool(settings.get("openai_api_key"))
@@ -99,7 +98,6 @@ class ChatHomeBaseAdapter:
         
         self.playwright = await async_playwright().start()
         
-        # More flags to hide "Test" indicator
         self.browser = await self.playwright.chromium.launch(
             headless=False, 
             proxy=self.proxy_config,
@@ -137,13 +135,10 @@ class ChatHomeBaseAdapter:
         
         self.page = await self.context.new_page()
         
-        # Maximize window
         await self._maximize_window()
         
-        # Check balance before login
         await self._check_balance()
         
-        # Login with retry
         logged_in = False
         for attempt in range(3):
             try:
@@ -167,7 +162,7 @@ class ChatHomeBaseAdapter:
         await self._process_assignments()
     
     async def _maximize_window(self):
-        """Maximize browser window to fill screen."""
+        """Maximize browser window."""
         try:
             screen_size = await self.page.evaluate("""() => {
                 return {
@@ -190,13 +185,42 @@ class ChatHomeBaseAdapter:
         except Exception as e:
             print(f"[WARNING] Could not maximize window: {e}")
     
-    async def _scroll_to_bottom(self):
-        """Scroll chat to bottom to show input box."""
+    async def _close_warnings(self):
+        """Close any warning banners/popups."""
         try:
-            # Scroll window to bottom
-            await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+            close_selectors = [
+                "button:has-text('CLOSE')",
+                "button:has-text('Close')",
+                "[data-testid='closeButton']",
+                ".close-button",
+                "button.close",
+                "div[role='alert'] button",
+                ".warning-close",
+                "[aria-label='Close']"
+            ]
             
-            # Try to find and scroll chat container
+            for selector in close_selectors:
+                try:
+                    close_btn = await self.page.query_selector(selector)
+                    if close_btn:
+                        await close_btn.click(timeout=1000)
+                        print("[INFO] Closed warning banner")
+                        await asyncio.sleep(0.5)
+                        break
+                except:
+                    continue
+        except:
+            pass
+    
+    async def _scroll_to_bottom(self):
+        """Scroll chat to bottom."""
+        try:
+            await self._close_warnings()
+            
+            for _ in range(3):
+                await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+                await asyncio.sleep(0.3)
+            
             chat_selectors = [
                 ".chat-container",
                 ".messages-container", 
@@ -210,16 +234,45 @@ class ChatHomeBaseAdapter:
                     chat_container = await self.page.query_selector(selector)
                     if chat_container:
                         await chat_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-                        break
+                        await asyncio.sleep(0.3)
                 except:
                     continue
             
-            await asyncio.sleep(0.5)  # Wait for scroll to complete
-        except Exception as e:
-            print(f"[DEBUG] Scroll error: {e}")
+            await self.page.keyboard.press("End")
+            await asyncio.sleep(0.3)
+        except:
+            pass
+    
+    async def _ensure_input_visible(self):
+        """Ensure typing input is visible on screen."""
+        try:
+            await self._close_warnings()
+            
+            input_selectors = [
+                "[data-testid='messageTextArea']",
+                ".chat-input",
+                "textarea",
+                "input[type='text']",
+                "[contenteditable='true']"
+            ]
+            
+            for selector in input_selectors:
+                try:
+                    element = await self.page.query_selector(selector)
+                    if element:
+                        await element.evaluate("el => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+                        await asyncio.sleep(0.5)
+                        return True
+                except:
+                    continue
+            
+            await self._scroll_to_bottom()
+            return False
+        except:
+            return False
         
     async def _process_assignments(self):
-        """Process chat assignments with platform history."""
+        """Process chat assignments."""
         while True:
             try:
                 if not await self._wait_for_assignment():
@@ -230,20 +283,16 @@ class ChatHomeBaseAdapter:
                 print(f"New Assignment")
                 print(f"{'='*60}")
                 
-                # SCRAPE PROFILES
                 self.customer_profile = await self._extract_customer_profile()
                 self.player_profile = await self._extract_player_profile()
                 
-                # Update excuse generator with scraped occupation
                 self.excuse_generator = DynamicExcuseGenerator(
                     self.deepseek,
                     self.player_profile.get("occupation", self.settings.get("player_occupation", ""))
                 )
                 
-                # READ PLATFORM HISTORY (previous conversations)
                 platform_history = await self._read_platform_history()
                 
-                # Update settings
                 self.settings["player_name"] = self.player_profile.get("name", "Player")
                 self.settings["player_occupation"] = self.player_profile.get("occupation", "Worker")
                 self.guard.customer_first_name = self.customer_profile.get("name", "Customer").split()[0]
@@ -284,7 +333,6 @@ class ChatHomeBaseAdapter:
                 except:
                     continue
             
-            # Extract fields
             patterns = {
                 "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
                 "age": r'Age[:\s]+(\d+)',
@@ -301,7 +349,6 @@ class ChatHomeBaseAdapter:
                 if match:
                     profile[field] = match.group(1).strip()
             
-            # About sections
             for section in ["About me", "About you", "Hobbies"]:
                 match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
                 if match:
@@ -355,7 +402,6 @@ class ChatHomeBaseAdapter:
                 if match:
                     profile["about"] = match.group(1).strip()
             
-            # Fallbacks
             if not profile.get("name"):
                 profile["name"] = self.settings.get("player_name") or "Player"
             if not profile.get("occupation"):
@@ -374,25 +420,23 @@ class ChatHomeBaseAdapter:
         return profile
         
     async def _process_current_chat(self):
-        """Process chat - respond to customer OR follow up if last message is from previous operator."""
+        """Process chat."""
+        await self._close_warnings()
+        
         conversation = await self._read_conversation_history()
         print(f"[INFO] History: {len(conversation)} messages")
         
         if not conversation:
             return
         
-        # Get last message
         last_msg = conversation[-1]
         
         if last_msg["speaker"] == "customer":
-            # Customer spoke last - respond normally
             print(f"[INFO] Customer: {last_msg['text'][:60]}...")
             await self._check_for_new_info(last_msg["text"])
             await self._generate_response(last_msg, conversation, is_follow_up=False)
             
         elif last_msg["speaker"] == "player":
-            # Previous operator spoke last, customer hasn't replied
-            # Check if we already sent a follow-up
             consecutive_player = 0
             for msg in reversed(conversation):
                 if msg["speaker"] == "player":
@@ -401,16 +445,15 @@ class ChatHomeBaseAdapter:
                     break
             
             if consecutive_player >= 2:
-                print("[INFO] Already sent follow-up, waiting for customer...")
+                print("[INFO] Already sent follow-up, waiting...")
                 return
             
-            # Send follow-up with AI-generated excuse
-            print("[INFO] No customer reply yet. Sending follow-up with excuse...")
+            print("[INFO] Sending follow-up...")
             category = self._classify(last_msg["text"]) if last_msg["text"] else "casual"
             await self._send_follow_up_with_excuse(category)
         
     async def _send_follow_up_with_excuse(self, category: str = "casual"):
-        """Send follow-up message with AI-generated excuse."""
+        """Send follow-up message."""
         excuse = self.excuse_generator.generate_excuse(category)
         
         if excuse:
@@ -418,12 +461,10 @@ class ChatHomeBaseAdapter:
             await self._type_response(excuse)
             await self._send_response()
         else:
-            # Fallback simple follow-up
             fallbacks = [
                 "Hey, you still there? What are you thinking about?",
                 "Got quiet on me. What's on your mind?",
-                "Still around? Tell me something interesting about you.",
-                "You disappeared on me. What are you up to?"
+                "Still around? Tell me something interesting."
             ]
             msg = random.choice(fallbacks)
             print(f"[INFO] Fallback follow-up: {msg}")
@@ -431,10 +472,9 @@ class ChatHomeBaseAdapter:
             await self._send_response()
         
     async def _check_for_new_info(self, customer_msg: str):
-        """Check if customer asks for info and maintain consistency."""
+        """Check if customer asks for info."""
         customer_lower = customer_msg.lower()
         
-        # Profession - check logbook first
         if any(word in customer_lower for word in ["work", "job", "do for a living", "what do you do", "profession", "career"]):
             existing_prof = self.logbook.get_player_profession()
             
@@ -453,7 +493,6 @@ class ChatHomeBaseAdapter:
                         self.logbook.set_profession(existing_prof, detail, self.customer_profile.get("name"))
                         print(f"[INFO] Detailed profession: {detail}")
             else:
-                # First time - invent profession
                 professions = [
                     ("teacher", "English teacher"),
                     ("nurse", "pediatric nurse"),
@@ -466,7 +505,6 @@ class ChatHomeBaseAdapter:
                 self.player_profile["occupation"] = detail
                 print(f"[INFO] Set profession: {detail}")
         
-        # Client profession
         if any(phrase in customer_lower for phrase in ["i am a", "i work as", "my job is", "i'm a"]):
             patterns = [
                 r'i am a[n]? ([\w\s]+)',
@@ -482,22 +520,19 @@ class ChatHomeBaseAdapter:
                     print(f"[INFO] Recorded client profession: {client_prof}")
                     break
         
-        # Sexual preferences/fantasies
         if any(word in customer_lower for word in ["fantasy", "dream", "like to try", "never tried", "experience"]):
             if "i've never" in customer_lower or "i want to" in customer_lower:
                 self.logbook.add_entry("Sexual", f"Customer shared: {customer_msg[:100]}", self.customer_profile.get("name"))
         
-        # Health mentions
         if any(word in customer_lower for word in ["sick", "surgery", "medical", "health", "migraine", "glasses", "smoke"]):
             self.logbook.add_entry("Health", f"Customer health info: {customer_msg[:100]}", self.customer_profile.get("name"))
         
-        # Photos received
         if "[Customer shared a photo:" in customer_msg:
             photo_desc = customer_msg.split("[Customer shared a photo:")[1].split("]")[0]
             self.logbook.add_entry("Update", f"Photo received: {photo_desc}", self.customer_profile.get("name"))
             
     async def _generate_response(self, last_msg: Dict, conversation: List[Dict], is_follow_up: bool = False):
-        """Generate response using scraped profiles."""
+        """Generate response."""
         recent = conversation[-15:]
         category = self._classify(last_msg["text"]) if not is_follow_up else "casual"
         
@@ -532,22 +567,20 @@ class ChatHomeBaseAdapter:
             print(f"[ERROR] {result['error']}")
 
     async def _read_platform_history(self) -> List[Dict]:
-        """Read previous conversation history from center of interface."""
+        """Read previous conversation history."""
         messages = []
         
         try:
-            # Look for historical messages (marked differently than current chat)
             all_bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
             
             for bubble in all_bubbles:
                 try:
                     classes = await bubble.get_attribute("class") or ""
                     
-                    # Check if this is marked as historical/old
                     is_old = any(marker in classes for marker in ["old", "previous", "history", "past", "read-only", "archived"])
                     
                     if not is_old:
-                        continue  # Skip current chat messages
+                        continue
                     
                     text_elem = await bubble.query_selector(".message-content, .text")
                     text = await text_elem.inner_text() if text_elem else ""
@@ -578,13 +611,12 @@ class ChatHomeBaseAdapter:
         return messages
     
     async def _extract_facts_from_history(self, history: List[Dict]):
-        """Scan previous conversation for facts player shared."""
+        """Scan previous conversation for facts."""
         player_messages = [m["text"] for m in history if m["speaker"] == "player"]
         
         for msg in player_messages:
             msg_lower = msg.lower()
             
-            # Extract profession mentions
             if any(phrase in msg_lower for phrase in ["i am a", "i'm a", "i work as", "my job is"]):
                 patterns = [
                     r'i am a[n]? ([\w\s]+?)(?:\.|$)',
@@ -601,7 +633,6 @@ class ChatHomeBaseAdapter:
                             print(f"[INFO] Extracted profession from history: {job}")
                         break
             
-            # Extract location mentions
             if "i live in" in msg_lower or "i'm from" in msg_lower or "i am from" in msg_lower:
                 patterns = [
                     r'i live in ([\w\s,]+?)(?:\.|$)',
@@ -656,11 +687,9 @@ class ChatHomeBaseAdapter:
                 else:
                     continue
                 
-                # Get text content
                 text_elem = await bubble.query_selector(".message-content, .text")
                 text = await text_elem.inner_text() if text_elem else ""
                 
-                # Check for images
                 image_elem = await bubble.query_selector("img, .message-image, [data-testid='messageImage']")
                 if image_elem and speaker == "customer":
                     image_url = await image_elem.get_attribute("src")
@@ -683,7 +712,6 @@ class ChatHomeBaseAdapter:
             return "photo"
         
         try:
-            # Download image using page evaluate
             js_code = """
                 async () => {
                     const res = await fetch("%s");
@@ -701,7 +729,6 @@ class ChatHomeBaseAdapter:
             if response and ',' in response:
                 base64_data = response.split(',')[1]
                 
-                # Use OpenAI to analyze
                 import openai
                 client = openai.AsyncOpenAI(api_key=self.openai_key)
                 
@@ -725,51 +752,72 @@ class ChatHomeBaseAdapter:
             print(f"[WARNING] Image analysis failed: {e}")
         
         return "photo"
-        
+    
     async def _type_response(self, text: str):
-        """Type response with scrolling to ensure input is visible."""
-        # Scroll to make sure input is visible
-        await self._scroll_to_bottom()
+        """Type like a human - slower, irregular, to avoid copy-paste detection."""
+        # Ensure input is visible first (NEW - fixes view issue)
+        await self._ensure_input_visible()
         
-        # Try multiple selectors for input box
+        # Find input box
         input_selectors = [
             "[data-testid='messageTextArea']",
             ".chat-input",
-            "textarea[placeholder*='message']",
             "textarea",
-            "[contenteditable='true']",
-            "input[type='text']"
+            "[contenteditable='true']"
         ]
         
-        input_found = False
+        input_box = None
         for selector in input_selectors:
             try:
-                # Check if element exists and is visible
-                element = await self.page.query_selector(selector)
-                if element:
-                    await element.scroll_into_view_if_needed()
-                    await element.click(timeout=2000)
-                    await element.fill("")
-                    
-                    # Type character by character
-                    for i, char in enumerate(text):
-                        await element.fill(text[:i+1])
-                        await asyncio.sleep(0.01)
-                    
-                    input_found = True
-                    print(f"[INFO] Typed response ({len(text)} chars)")
+                input_box = await self.page.query_selector(selector)
+                if input_box:
+                    await input_box.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.5)
+                    await input_box.click()
                     break
-            except Exception as e:
+            except:
                 continue
         
-        if not input_found:
-            print("[ERROR] Could not find input box to type in")
+        if not input_box:
+            print("[ERROR] Could not find input box")
+            return
+        
+        # Clear existing text naturally
+        await self.page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await self.page.keyboard.press("Delete")
+        await asyncio.sleep(0.3)
+        
+        # TYPE LIKE A HUMAN (fixes copy-paste warning)
+        print(f"[INFO] Typing {len(text)} characters...")
+        
+        words = text.split()
+        for i, word in enumerate(words):
+            # Type each character with human delay (80-250ms)
+            for char in word:
+                delay = random.uniform(80, 250)
+                await self.page.keyboard.type(char, delay=delay)
+                
+                # Occasional longer pause (thinking)
+                if random.random() < 0.05:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+            
+            # Space between words
+            if i < len(words) - 1:
+                await self.page.keyboard.type(" ", delay=random.uniform(50, 150))
+                
+                # Occasional pause between words
+                if random.random() < 0.1:
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+        
+        print("[INFO] Finished typing")
         
     async def _send_response(self):
         if self.dry_run:
             print("[DRY RUN] Review and press Enter...")
             input()
-            await self.page.fill("[data-testid='messageTextArea'], .chat-input", "")
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Delete")
             return
         
         # Try multiple send button selectors
@@ -792,7 +840,9 @@ class ChatHomeBaseAdapter:
                 continue
         
         if not sent:
-            print("[ERROR] Could not find send button")
+            # Fallback: press Enter key
+            await self.page.keyboard.press("Enter")
+            print("[INFO] Sent (using Enter key)")
         
         # Scroll after sending
         await self._scroll_to_bottom()
@@ -808,7 +858,7 @@ class ChatHomeBaseAdapter:
     async def _wait_for_assignment(self) -> bool:
         try:
             await self.page.wait_for_selector(".message-blob, .chat-message", timeout=10000)
-            await self._scroll_to_bottom()  # Scroll when chat loads
+            await self._scroll_to_bottom()
             return True
         except:
             return False
@@ -825,7 +875,6 @@ class ChatHomeBaseAdapter:
         balance = self.deepseek.check_balance()
         print(f"[INFO] DeepSeek balance: ${balance:.2f}")
         
-        # Only send notification if Telegram is enabled
         if balance < 4.0 and self.telegram_enabled and self.notifier:
             try:
                 self.notifier.notify_low_balance(self.telegram_user_id, balance, 4.0)
@@ -833,33 +882,27 @@ class ChatHomeBaseAdapter:
                 print(f"[WARNING] Failed to send Telegram: {e}")
         
     async def _login(self):
-        """Login to chathomebase with retry logic and extended timeout."""
+        """Login to chathomebase."""
         print("[INFO] Logging in...")
         
         try:
-            # Navigate to login page
             await self.page.goto("https://chathomebase.com/login")
             
-            # Fill credentials
             await self.page.fill("input[name='email']", self.settings["chathomebase_login"])
             await self.page.fill("input[name='password']", self.settings["chathomebase_password"])
             
-            # Click login button
             await self.page.click("[data-testid='signInButton']")
             
-            # Wait for navigation to lobby - 30 SECOND TIMEOUT
             await self.page.wait_for_url("**/chat/lobby", timeout=30000)
             
             print("[INFO] Successfully logged in")
             
         except Exception as e:
-            # Check current URL to diagnose
             current_url = self.page.url
             print(f"[ERROR] Login failed. Current URL: {current_url}")
             print(f"[ERROR] Timeout waiting for /chat/lobby: {e}")
             raise
         
-        # Handle announcements dialog
         for _ in range(5):
             try:
                 await self.page.click("[data-testid='announcementsDialogNextButton']", timeout=2000)
