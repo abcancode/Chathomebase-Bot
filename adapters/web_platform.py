@@ -75,7 +75,7 @@ class ChatHomeBaseAdapter:
                 self.telegram_enabled = True
             except ImportError:
                 print("[WARNING] telegram_notify not installed. Notifications disabled.")
-                print("To enable: pip install telegram-notify")
+                print("To enable: pip install python-telegram-bot")
         
         # OpenAI for vision
         self.openai_enabled = bool(settings.get("openai_api_key"))
@@ -99,7 +99,7 @@ class ChatHomeBaseAdapter:
         
         self.playwright = await async_playwright().start()
         
-        # FIX: More flags to hide "Test" indicator
+        # More flags to hide "Test" indicator
         self.browser = await self.playwright.chromium.launch(
             headless=False, 
             proxy=self.proxy_config,
@@ -189,6 +189,34 @@ class ChatHomeBaseAdapter:
             print(f"[INFO] Window maximized to {screen_size['width']}x{screen_size['height']}")
         except Exception as e:
             print(f"[WARNING] Could not maximize window: {e}")
+    
+    async def _scroll_to_bottom(self):
+        """Scroll chat to bottom to show input box."""
+        try:
+            # Scroll window to bottom
+            await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+            
+            # Try to find and scroll chat container
+            chat_selectors = [
+                ".chat-container",
+                ".messages-container", 
+                "[data-testid='chatMessages']",
+                ".message-list",
+                ".chat-messages"
+            ]
+            
+            for selector in chat_selectors:
+                try:
+                    chat_container = await self.page.query_selector(selector)
+                    if chat_container:
+                        await chat_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                        break
+                except:
+                    continue
+            
+            await asyncio.sleep(0.5)  # Wait for scroll to complete
+        except Exception as e:
+            print(f"[DEBUG] Scroll error: {e}")
         
     async def _process_assignments(self):
         """Process chat assignments with platform history."""
@@ -699,20 +727,75 @@ class ChatHomeBaseAdapter:
         return "photo"
         
     async def _type_response(self, text: str):
-        await self.page.click("[data-testid='messageTextArea'], .chat-input")
-        await self.page.fill("[data-testid='messageTextArea'], .chat-input", "")
-        for i, char in enumerate(text):
-            await self.page.fill("[data-testid='messageTextArea'], .chat-input", text[:i+1])
-            await asyncio.sleep(0.01)
-            
+        """Type response with scrolling to ensure input is visible."""
+        # Scroll to make sure input is visible
+        await self._scroll_to_bottom()
+        
+        # Try multiple selectors for input box
+        input_selectors = [
+            "[data-testid='messageTextArea']",
+            ".chat-input",
+            "textarea[placeholder*='message']",
+            "textarea",
+            "[contenteditable='true']",
+            "input[type='text']"
+        ]
+        
+        input_found = False
+        for selector in input_selectors:
+            try:
+                # Check if element exists and is visible
+                element = await self.page.query_selector(selector)
+                if element:
+                    await element.scroll_into_view_if_needed()
+                    await element.click(timeout=2000)
+                    await element.fill("")
+                    
+                    # Type character by character
+                    for i, char in enumerate(text):
+                        await element.fill(text[:i+1])
+                        await asyncio.sleep(0.01)
+                    
+                    input_found = True
+                    print(f"[INFO] Typed response ({len(text)} chars)")
+                    break
+            except Exception as e:
+                continue
+        
+        if not input_found:
+            print("[ERROR] Could not find input box to type in")
+        
     async def _send_response(self):
         if self.dry_run:
             print("[DRY RUN] Review and press Enter...")
             input()
             await self.page.fill("[data-testid='messageTextArea'], .chat-input", "")
             return
-        await self.page.click("[data-testid='sendChatMessageButton'], .send-button")
-        print("[INFO] Sent")
+        
+        # Try multiple send button selectors
+        send_selectors = [
+            "[data-testid='sendChatMessageButton']",
+            ".send-button",
+            "button[type='submit']",
+            "button:has-text('Send')",
+            "button.send"
+        ]
+        
+        sent = False
+        for selector in send_selectors:
+            try:
+                await self.page.click(selector, timeout=2000)
+                sent = True
+                print("[INFO] Sent")
+                break
+            except:
+                continue
+        
+        if not sent:
+            print("[ERROR] Could not find send button")
+        
+        # Scroll after sending
+        await self._scroll_to_bottom()
         
     def _classify(self, text: str) -> str:
         t = text.lower()
@@ -725,6 +808,7 @@ class ChatHomeBaseAdapter:
     async def _wait_for_assignment(self) -> bool:
         try:
             await self.page.wait_for_selector(".message-blob, .chat-message", timeout=10000)
+            await self._scroll_to_bottom()  # Scroll when chat loads
             return True
         except:
             return False
