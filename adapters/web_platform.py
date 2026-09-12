@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 from core.deepseek_client import DeepSeekClient
@@ -22,7 +23,21 @@ class ChatHomeBaseAdapter:
     def __init__(self, settings: dict, dry_run: bool = False):
         self.settings = settings
         self.dry_run = dry_run
+        
+        # Parse proxy if provided
         self.proxy = settings.get("proxy")
+        self.proxy_config = None
+        if self.proxy and self.proxy.get("server"):
+            proxy_url = self.proxy["server"]
+            if "@" in proxy_url:
+                parsed = urlparse(proxy_url)
+                self.proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password
+                }
+            else:
+                self.proxy_config = {"server": proxy_url}
         
         # Bot brain
         data_dir = Path(__file__).parent.parent / "data"
@@ -76,17 +91,41 @@ class ChatHomeBaseAdapter:
         print(f"{'='*60}\n")
         
         self.playwright = await async_playwright().start()
+        
+        # FIX 1 & 2: Hide "Test" indicator and maximize window properly
         self.browser = await self.playwright.chromium.launch(
             headless=False, 
-            proxy=self.proxy,
-            args=["--start-fullscreen", "--force-device-scale-factor=0.95"],
+            proxy=self.proxy_config,
+            args=[
+                "--force-device-scale-factor=1.0",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-webgl",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--start-maximized"
+            ],
             slow_mo=100
         )
+        
+        # Use larger viewport for near-fullscreen
         self.context = await self.browser.new_context(
-            viewport={"width": 1280, "height": 720}, 
-            proxy=self.proxy
+            viewport={"width": 1920, "height": 1000},  # Near fullscreen
+            screen={"width": 1920, "height": 1080},
+            proxy=self.proxy_config,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
         )
+        
         self.page = await self.context.new_page()
+        
+        # Maximize window after creation
+        await self._maximize_window()
         
         # Check balance before login
         await self._check_balance()
@@ -113,6 +152,33 @@ class ChatHomeBaseAdapter:
         print("        (Profiles will be scraped when chat loads)\n")
         
         await self._process_assignments()
+    
+    async def _maximize_window(self):
+        """Maximize browser window to fill screen."""
+        try:
+            # Get screen size
+            screen_size = await self.page.evaluate("""() => {
+                return {
+                    width: window.screen.availWidth,
+                    height: window.screen.availHeight
+                };
+            }""")
+            
+            # Set viewport to screen size
+            await self.page.set_viewport_size({
+                "width": screen_size["width"],
+                "height": screen_size["height"] - 40  # Leave room for taskbar
+            })
+            
+            # Try to maximize window
+            await self.page.evaluate("""() => {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+            }""")
+            
+            print(f"[INFO] Window maximized to {screen_size['width']}x{screen_size['height']}")
+        except Exception as e:
+            print(f"[WARNING] Could not maximize window: {e}")
         
     async def _process_assignments(self):
         """Process chat assignments with platform history."""
@@ -469,7 +535,7 @@ class ChatHomeBaseAdapter:
             print(f"[WARNING] Failed to read platform history: {e}")
         
         if messages:
-            print(f"[INFO] Loaded {len(messages)} messages from platform history")
+            print(f"[INFO] Loaded {len(platform_history)} messages from platform history")
             
         return messages
     
@@ -579,18 +645,20 @@ class ChatHomeBaseAdapter:
             return "photo"
         
         try:
-            # Download image
-            response = await self.page.evaluate(f"""
-                async () => {{
-                    const res = await fetch("{image_url}");
+            # Download image using page evaluate
+            js_code = """
+                async () => {
+                    const res = await fetch("%s");
                     const blob = await res.blob();
-                    return new Promise((resolve) => {{
+                    return new Promise((resolve) => {
                         const reader = new FileReader();
                         reader.onloadend = () => resolve(reader.result);
                         reader.readAsDataURL(blob);
-                    }});
-                }}
-            ''')
+                    });
+                }
+            """ % image_url
+            
+            response = await self.page.evaluate(js_code)
             
             if response and ',' in response:
                 base64_data = response.split(',')[1]
