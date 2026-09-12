@@ -63,12 +63,19 @@ class ChatHomeBaseAdapter:
             settings.get("player_occupation", "")
         )
         
-        # Telegram
-        self.telegram_enabled = bool(settings.get("telegram_user_id") and settings.get("telegram_bot_token"))
-        if self.telegram_enabled:
-            from telegram_notify.notifier import TelegramNotifier
-            self.notifier = TelegramNotifier(settings.get("telegram_bot_token"))
-            self.telegram_user_id = settings.get("telegram_user_id")
+        # Telegram - Optional (won't crash if not installed)
+        self.telegram_enabled = False
+        self.notifier = None
+        self.telegram_user_id = None
+        if settings.get("telegram_user_id") and settings.get("telegram_bot_token"):
+            try:
+                from telegram_notify.notifier import TelegramNotifier
+                self.notifier = TelegramNotifier(settings.get("telegram_bot_token"))
+                self.telegram_user_id = settings.get("telegram_user_id")
+                self.telegram_enabled = True
+            except ImportError:
+                print("[WARNING] telegram_notify not installed. Notifications disabled.")
+                print("To enable: pip install telegram-notify")
         
         # OpenAI for vision
         self.openai_enabled = bool(settings.get("openai_api_key"))
@@ -92,7 +99,7 @@ class ChatHomeBaseAdapter:
         
         self.playwright = await async_playwright().start()
         
-        # FIX 1 & 2: Hide "Test" indicator and maximize window properly
+        # FIX: More flags to hide "Test" indicator
         self.browser = await self.playwright.chromium.launch(
             headless=False, 
             proxy=self.proxy_config,
@@ -109,14 +116,20 @@ class ChatHomeBaseAdapter:
                 "--disable-webgl",
                 "--disable-infobars",
                 "--window-size=1920,1080",
-                "--start-maximized"
+                "--start-maximized",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
             ],
             slow_mo=100
         )
         
-        # Use larger viewport for near-fullscreen
         self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1000},  # Near fullscreen
+            viewport={"width": 1920, "height": 1000},
             screen={"width": 1920, "height": 1080},
             proxy=self.proxy_config,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
@@ -124,7 +137,7 @@ class ChatHomeBaseAdapter:
         
         self.page = await self.context.new_page()
         
-        # Maximize window after creation
+        # Maximize window
         await self._maximize_window()
         
         # Check balance before login
@@ -156,7 +169,6 @@ class ChatHomeBaseAdapter:
     async def _maximize_window(self):
         """Maximize browser window to fill screen."""
         try:
-            # Get screen size
             screen_size = await self.page.evaluate("""() => {
                 return {
                     width: window.screen.availWidth,
@@ -164,13 +176,11 @@ class ChatHomeBaseAdapter:
                 };
             }""")
             
-            # Set viewport to screen size
             await self.page.set_viewport_size({
                 "width": screen_size["width"],
-                "height": screen_size["height"] - 40  # Leave room for taskbar
+                "height": screen_size["height"] - 40
             })
             
-            # Try to maximize window
             await self.page.evaluate("""() => {
                 window.moveTo(0, 0);
                 window.resizeTo(screen.availWidth, screen.availHeight);
@@ -535,7 +545,7 @@ class ChatHomeBaseAdapter:
             print(f"[WARNING] Failed to read platform history: {e}")
         
         if messages:
-            print(f"[INFO] Loaded {len(platform_history)} messages from platform history")
+            print(f"[INFO] Loaded {len(messages)} messages from platform history")
             
         return messages
     
@@ -730,11 +740,13 @@ class ChatHomeBaseAdapter:
     async def _check_balance(self):
         balance = self.deepseek.check_balance()
         print(f"[INFO] DeepSeek balance: ${balance:.2f}")
-        if balance < 4.0 and self.telegram_enabled:
+        
+        # Only send notification if Telegram is enabled
+        if balance < 4.0 and self.telegram_enabled and self.notifier:
             try:
                 self.notifier.notify_low_balance(self.telegram_user_id, balance, 4.0)
-            except:
-                pass
+            except Exception as e:
+                print(f"[WARNING] Failed to send Telegram: {e}")
         
     async def _login(self):
         """Login to chathomebase with retry logic and extended timeout."""

@@ -22,24 +22,35 @@ class DeepSeekClient:
         import time
         if time.time() - self._balance_time < 60 and self._balance_cache is not None:
             return self._balance_cache
-            
+        
         try:
             response = requests.get(
                 f"{self.base_url}/user/balance",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=10
             )
+            
             if response.status_code == 200:
                 data = response.json()
-                balance = data.get("balance", 0) / 100  # Convert cents to dollars
-                self._balance_cache = balance
-                self._balance_time = time.time()
-                return balance
+                
+                # DeepSeek returns balance in balance_infos array
+                if "balance_infos" in data and len(data["balance_infos"]) > 0:
+                    balance_info = data["balance_infos"][0]
+                    balance = float(balance_info.get("total_balance", 0))
+                    self._balance_cache = balance
+                    self._balance_time = time.time()
+                    return balance
+                else:
+                    print(f"[WARNING] Unexpected balance format")
+                    return 0.0
+            else:
+                print(f"[ERROR] Balance check failed: {response.status_code}")
+                
         except Exception as e:
-            print(f"[WARNING] Balance check failed: {e}")
+            print(f"[ERROR] Balance check exception: {e}")
         
         return self._balance_cache or 0.0
-    
+        
     def generate(self, system_prompt: str, history: List[Dict], user_message: str, temperature: float = 0.95) -> Dict:
         """Generate response with retries and guard checking."""
         
@@ -88,3 +99,5 @@ class DeepSeekClient:
                 time.sleep(1)
         
         return {"ok": False, "error": "Max retries exceeded"}
+
+        
