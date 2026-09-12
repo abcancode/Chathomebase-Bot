@@ -37,14 +37,32 @@ def run_wizard(config_file: Path):
     chb_password = Prompt.ask("ChatHomeBase password", 
                                password=True).strip()
     
-    # Optional: Proxy
+   # Optional: Proxy
     console.rule("[bold]Proxy (Optional)[/bold]")
     use_proxy = Confirm.ask("Use proxy?", default=False)
     proxy = None
     if use_proxy:
-        proxy_server = Prompt.ask("Proxy server (e.g., http://proxy:8080 or socks5://user:pass@host:port)").strip()
-        if proxy_server:
-            proxy = {"server": proxy_server}
+        console.print("Formats accepted:")
+        console.print("  - URL: http://user:pass@host:port")
+        console.print("  - IP format: 1.2.3.4:8080:user:pass")
+        proxy_input = Prompt.ask("Proxy server").strip()
+        
+        if proxy_input:
+            # Check if it's IP:Port:User:Pass format
+            if proxy_input.count(":") >= 3 and not proxy_input.startswith("http"):
+                # Convert 1.2.3.4:8080:user:pass to http://user:pass@1.2.3.4:8080
+                parts = proxy_input.split(":")
+                if len(parts) >= 4:
+                    ip = parts[0]
+                    port = parts[1]
+                    username = parts[2]
+                    password = ":".join(parts[3:])  # Password might contain colons
+                    proxy_url = f"http://{username}:{password}@{ip}:{port}"
+                    proxy = {"server": proxy_url}
+                    console.print(f"[green]Converted to: {proxy_url}[/green]")
+            else:
+                # Already in URL format
+                proxy = {"server": proxy_input}
     
     # Optional: Telegram notifications
     console.rule("[bold]Telegram Notifications (Optional)[/bold]")
