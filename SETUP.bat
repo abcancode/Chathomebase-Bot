@@ -7,7 +7,6 @@ echo ChatHomeBase Bot Setup
 echo =======================================
 echo.
 
-:: Check if Python is installed
 python --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python is not installed!
@@ -17,38 +16,35 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Check if already configured
 if exist "config\settings.json" (
+    echo Account already configured.
     echo.
-    echo =======================================
-    echo Account already configured!
-    echo =======================================
+    choice /C YN /M "Do you want to update the existing configuration"
+    if errorlevel 2 (
+        echo.
+        echo Nothing changed. Run LAUNCH.bat to start the bot.
+        pause
+        exit /b 0
+    )
     echo.
-    echo To reconfigure, delete config\settings.json
-    echo To start the bot, run LAUNCH.bat
-    echo.
-    pause
-    exit /b 0
 )
 
-:: Install dependencies (only first time)
+echo Checking dependencies...
+python -m pip install -q -r requirements.txt
+if errorlevel 1 (
+    echo ERROR: Failed to install dependencies
+    pause
+    exit /b 1
+)
+
 if not exist ".installed" (
-    echo Installing dependencies... (this may take a few minutes)
-    pip install -r requirements.txt
-    if errorlevel 1 (
-        echo ERROR: Failed to install dependencies
-        pause
-        exit /b 1
-    )
-    
-    echo Installing browser...
-    playwright install chromium
+    echo Installing browser... (this may take a few minutes)
+    python -m playwright install chromium
     if errorlevel 1 (
         echo ERROR: Failed to install browser
         pause
         exit /b 1
     )
-    
     echo. > .installed
     echo.
     echo =======================================
@@ -57,8 +53,7 @@ if not exist ".installed" (
     echo.
 )
 
-:: Run setup wizard
-python -c "from bootstrap.first_run_wizard import run_wizard; from pathlib import Path; run_wizard(Path('config/settings.json'))"
+python bootstrap\first_run_wizard.py
 
 echo.
 pause

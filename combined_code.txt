@@ -1,0 +1,3842 @@
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\launch_bot.py ===
+#!/usr/bin/env python3
+"""Launch bot with web automation."""
+
+import asyncio
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config.settings import load_settings
+from adapters.web_platform import run_web_bot
+
+
+def main():
+    config_file = Path(__file__).parent / "config" / "settings.json"
+    
+    if not config_file.exists():
+        print("ERROR: Account not configured. Run SETUP.bat first.")
+        sys.exit(1)
+    
+    settings = load_settings(config_file)
+    
+    # Check required settings
+    required = ["deepseek_api_key", "chathomebase_login", "chathomebase_password"]
+    missing = [k for k in required if not settings.get(k)]
+    if missing:
+        print(f"ERROR: Missing settings: {', '.join(missing)}")
+        print("Run SETUP.bat to configure.")
+        sys.exit(1)
+    
+    # Run bot - LIVE MODE (sends messages automatically)
+    try:
+        asyncio.run(run_web_bot(settings, dry_run=False))
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopped by user")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        input("Press Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\adapters\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\adapters\web_platform.py ===
+"""Web automation for chathomebase.com — Auto-assignment with profile scraping."""
+
+import asyncio
+import json
+import re
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+
+from core.deepseek_client import DeepSeekClient
+from core.rule_guard import RuleGuard
+from core.logbook import Logbook
+from core.prompt_builder import load_rules, build_system_prompt, build_history_messages
+from core.excuse_bank import DynamicExcuseGenerator
+
+
+class ChatHomeBaseAdapter:
+    """Auto-assignment bot that scrapes profiles from platform."""
+    
+    def __init__(self, settings: dict, dry_run: bool = False):
+        self.settings = settings
+        self.dry_run = dry_run
+        
+        # Parse proxy if provided
+        self.proxy = settings.get("proxy")
+        self.proxy_config = None
+        if self.proxy and self.proxy.get("server"):
+            proxy_url = self.proxy["server"]
+            if "@" in proxy_url:
+                parsed = urlparse(proxy_url)
+                self.proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password
+                }
+            else:
+                self.proxy_config = {"server": proxy_url}
+        
+        # Bot brain
+        data_dir = Path(__file__).parent.parent / "data"
+        log_dir = Path(__file__).parent.parent / "logs" / "logbooks"
+        
+        self.rules = load_rules(data_dir / "rules.json")
+        self.guard = RuleGuard(
+            data_dir / "rules.json",
+            data_dir / "banned_phrases.json",
+            "Customer"
+        )
+        self.deepseek = DeepSeekClient(
+            api_key=settings["deepseek_api_key"],
+            guard=self.guard,
+            low_balance_threshold_usd=settings.get("deepseek_low_balance_threshold_usd", 4.0),
+            max_retries=3
+        )
+        self.logbook = Logbook(log_dir, settings.get("customer_name", "Customer"))
+        
+        # Excuse generator for follow-ups
+        self.excuse_generator = DynamicExcuseGenerator(
+            self.deepseek,
+            settings.get("player_occupation", "")
+        )
+        
+        # Telegram - Optional
+        self.telegram_enabled = False
+        self.notifier = None
+        self.telegram_user_id = None
+        if settings.get("telegram_user_id") and settings.get("telegram_bot_token"):
+            try:
+                from telegram_notify.notifier import TelegramNotifier
+                self.notifier = TelegramNotifier(settings.get("telegram_bot_token"))
+                self.telegram_user_id = settings.get("telegram_user_id")
+                self.telegram_enabled = True
+            except ImportError:
+                print("[WARNING] telegram_notify not installed. Notifications disabled.")
+        
+        # OpenAI for vision
+        self.openai_enabled = bool(settings.get("openai_api_key"))
+        self.openai_key = settings.get("openai_api_key")
+        
+        # Web
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        
+        # Scraped profiles
+        self.customer_profile: Dict = {}
+        self.player_profile: Dict = {}
+        
+    async def start(self):
+    """Launch and process assignments."""
+    print(f"\n{'='*60}")
+    print(f"ChatHomeBase Bot")
+    print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
+    print(f"{'='*60}\n")
+    
+    self.playwright = await async_playwright().start()
+    
+    # REDUCED SIZE for codegen inspection - change back to 1920,1080 after inspection
+    VIEWPORT_WIDTH = 1280
+    VIEWPORT_HEIGHT = 720
+    
+    self.browser = await self.playwright.chromium.launch(
+        headless=False, 
+        proxy=self.proxy_config,
+        args=[
+            "--force-device-scale-factor=1.0",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-web-security",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-gpu",
+            "--disable-webgl",
+            "--disable-infobars",
+            f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}",
+            # REMOVED: --start-maximized (so window stays at specified size)
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding"
+        ],
+        slow_mo=100
+    )
+    
+    self.context = await self.browser.new_context(
+        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        # REMOVED: screen size (not needed for smaller window)
+        proxy=self.proxy_config,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
+    )
+    
+    self.page = await self.context.new_page()
+    
+    # COMMENTED OUT maximize for now - uncomment after codegen inspection
+    # await self._maximize_window()
+    
+    await self._check_balance()
+    # ... rest of method unchanged
+    
+        """Launch and process assignments."""
+        print(f"\n{'='*60}")
+        print(f"ChatHomeBase Bot")
+        print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
+        print(f"{'='*60}\n")
+        
+        self.playwright = await async_playwright().start()
+        
+        self.browser = await self.playwright.chromium.launch(
+            headless=False, 
+            proxy=self.proxy_config,
+            args=[
+                "--force-device-scale-factor=1.0",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-webgl",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--start-maximized",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
+            ],
+            slow_mo=100
+        )
+        
+        self.context = await self.browser.new_context(
+            viewport={"width": 1920, "height": 1000},
+            screen={"width": 1920, "height": 1080},
+            proxy=self.proxy_config,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
+        )
+        
+        self.page = await self.context.new_page()
+        
+        await self._maximize_window()
+        
+        await self._check_balance()
+        
+        logged_in = False
+        for attempt in range(3):
+            try:
+                logged_in = await self._login()
+                if logged_in:
+                    break
+            except Exception as e:
+                print(f"[WARNING] Login attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    print("[INFO] Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+        
+        if not logged_in:
+            print("[ERROR] Could not log in after 3 attempts")
+            await self.stop()
+            return
+        
+        print("[INFO] Waiting for chat assignments...")
+        print("        (Profiles will be scraped when chat loads)\n")
+        
+        await self._process_assignments()
+    
+    async def _maximize_window(self):
+        """Maximize browser window."""
+        try:
+            screen_size = await self.page.evaluate("""() => {
+                return {
+                    width: window.screen.availWidth,
+                    height: window.screen.availHeight
+                };
+            }""")
+            
+            await self.page.set_viewport_size({
+                "width": screen_size["width"],
+                "height": screen_size["height"] - 40
+            })
+            
+            await self.page.evaluate("""() => {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+            }""")
+            
+            print(f"[INFO] Window maximized to {screen_size['width']}x{screen_size['height']}")
+        except Exception as e:
+            print(f"[WARNING] Could not maximize window: {e}")
+    
+    async def _close_warnings(self):
+        """Close any warning banners/popups."""
+        try:
+            close_selectors = [
+                "button:has-text('CLOSE')",
+                "button:has-text('Close')",
+                "[data-testid='closeButton']",
+                ".close-button",
+                "button.close",
+                "div[role='alert'] button",
+                ".warning-close",
+                "[aria-label='Close']"
+            ]
+            
+            for selector in close_selectors:
+                try:
+                    close_btn = await self.page.query_selector(selector)
+                    if close_btn:
+                        await close_btn.click(timeout=1000)
+                        print("[INFO] Closed warning banner")
+                        await asyncio.sleep(0.5)
+                        break
+                except:
+                    continue
+        except:
+            pass
+    
+    async def _scroll_to_bottom(self):
+        """Scroll chat to bottom."""
+        try:
+            await self._close_warnings()
+            
+            for _ in range(3):
+                await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+                await asyncio.sleep(0.3)
+            
+            chat_selectors = [
+                ".chat-container",
+                ".messages-container", 
+                "[data-testid='chatMessages']",
+                ".message-list",
+                ".chat-messages"
+            ]
+            
+            for selector in chat_selectors:
+                try:
+                    chat_container = await self.page.query_selector(selector)
+                    if chat_container:
+                        await chat_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                        await asyncio.sleep(0.3)
+                except:
+                    continue
+            
+            await self.page.keyboard.press("End")
+            await asyncio.sleep(0.3)
+        except:
+            pass
+    
+    async def _ensure_input_visible(self):
+        """Ensure typing input is visible on screen."""
+        try:
+            await self._close_warnings()
+            
+            input_selectors = [
+                "[data-testid='messageTextArea']",
+                ".chat-input",
+                "textarea",
+                "input[type='text']",
+                "[contenteditable='true']"
+            ]
+            
+            for selector in input_selectors:
+                try:
+                    element = await self.page.query_selector(selector)
+                    if element:
+                        await element.evaluate("el => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+                        await asyncio.sleep(0.5)
+                        return True
+                except:
+                    continue
+            
+            await self._scroll_to_bottom()
+            return False
+        except:
+            return False
+        
+    async def _process_assignments(self):
+        """Process chat assignments."""
+        while True:
+            try:
+                if not await self._wait_for_assignment():
+                    await asyncio.sleep(2)
+                    continue
+                
+                print(f"\n{'='*60}")
+                print(f"New Assignment")
+                print(f"{'='*60}")
+                
+                self.customer_profile = await self._extract_customer_profile()
+                self.player_profile = await self._extract_player_profile()
+                
+                self.excuse_generator = DynamicExcuseGenerator(
+                    self.deepseek,
+                    self.player_profile.get("occupation", self.settings.get("player_occupation", ""))
+                )
+                
+                platform_history = await self._read_platform_history()
+                
+                self.settings["player_name"] = self.player_profile.get("name", "Player")
+                self.settings["player_occupation"] = self.player_profile.get("occupation", "Worker")
+                self.guard.customer_first_name = self.customer_profile.get("name", "Customer").split()[0]
+                
+                print(f"[INFO] Player: {self.player_profile.get('name')}")
+                print(f"[INFO] Customer: {self.customer_profile.get('name')}")
+                
+                if platform_history:
+                    print(f"[INFO] Previous conversation: {len(platform_history)} messages")
+                    await self._extract_facts_from_history(platform_history)
+                
+                await self._process_current_chat()
+                await self._wait_for_chat_close()
+                print("[INFO] Waiting for next assignment...")
+                
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                await asyncio.sleep(5)
+                
+    async def _extract_customer_profile(self) -> Dict:
+        """Scrape customer profile from LEFT sidebar."""
+        profile = {}
+        
+        try:
+            selectors = [
+                "[data-testid='customerProfile']",
+                ".customer-profile",
+                ".left-sidebar",
+                ".chat-sidebar-left"
+            ]
+            
+            profile_text = ""
+            for selector in selectors:
+                try:
+                    profile_text = await self.page.inner_text(selector, timeout=30000)
+                    if profile_text:
+                        break
+                except:
+                    continue
+            
+            patterns = {
+                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
+                "age": r'Age[:\s]+(\d+)',
+                "location": r'Location[:\s]+([^\n]+)',
+                "occupation": r'Occupation[:\s]+([^\n]+)',
+                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
+                "height": r'(\d+ft[\s\din-]+)',
+                "body_type": r'(Slim|Athletic|Curvaceous|Average)',
+                "status": r'(Single|Married|Divorced)',
+            }
+            
+            for field, pattern in patterns.items():
+                match = re.search(pattern, profile_text, re.IGNORECASE)
+                if match:
+                    profile[field] = match.group(1).strip()
+            
+            for section in ["About me", "About you", "Hobbies"]:
+                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
+                if match:
+                    profile[section.lower().replace(" ", "_")] = match.group(1).strip()
+                    
+        except Exception as e:
+            print(f"[WARNING] Customer profile error: {e}")
+            profile["name"] = "Customer"
+        
+        return profile
+        
+    async def _extract_player_profile(self) -> Dict:
+        """Scrape PLAYER profile from RIGHT sidebar."""
+        profile = {}
+        
+        try:
+            selectors = [
+                "[data-testid='playerProfile']",
+                ".player-profile",
+                ".right-sidebar",
+                ".chat-sidebar-right",
+                ".entertainment-profile"
+            ]
+            
+            profile_text = ""
+            for selector in selectors:
+                try:
+                    profile_text = await self.page.inner_text(selector, timeout=2000)
+                    if profile_text:
+                        break
+                except:
+                    continue
+            
+            patterns = {
+                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
+                "age": r'Age[:\s]+(\d+)',
+                "occupation": r'Occupation[:\s]+([^\n]+)',
+                "location": r'Location[:\s]+([^\n]+)',
+                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
+                "hair": r'(Blonde|Brunette|Red|Black|Brown) hair?',
+                "body_type": r'(Slim|Athletic|Curvy|Average)',
+            }
+            
+            for field, pattern in patterns.items():
+                match = re.search(pattern, profile_text, re.IGNORECASE)
+                if match:
+                    profile[field] = match.group(1).strip()
+            
+            for section in ["About me", "Description", "Bio"]:
+                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
+                if match:
+                    profile["about"] = match.group(1).strip()
+            
+            if not profile.get("name"):
+                profile["name"] = self.settings.get("player_name") or "Player"
+            if not profile.get("occupation"):
+                profile["occupation"] = self.settings.get("player_occupation") or "Worker"
+            if not profile.get("location"):
+                profile["location"] = self.settings.get("player_location_cached")
+                
+        except Exception as e:
+            print(f"[WARNING] Player profile error: {e}")
+            profile = {
+                "name": self.settings.get("player_name", "Player"),
+                "occupation": self.settings.get("player_occupation", "Worker"),
+                "location": self.settings.get("player_location_cached")
+            }
+        
+        return profile
+        
+    async def _process_current_chat(self):
+        """Process chat."""
+        await self._close_warnings()
+        
+        conversation = await self._read_conversation_history()
+        print(f"[INFO] History: {len(conversation)} messages")
+        
+        if not conversation:
+            return
+        
+        last_msg = conversation[-1]
+        
+        if last_msg["speaker"] == "customer":
+            print(f"[INFO] Customer: {last_msg['text'][:60]}...")
+            await self._check_for_new_info(last_msg["text"])
+            await self._generate_response(last_msg, conversation, is_follow_up=False)
+            
+        elif last_msg["speaker"] == "player":
+            consecutive_player = 0
+            for msg in reversed(conversation):
+                if msg["speaker"] == "player":
+                    consecutive_player += 1
+                else:
+                    break
+            
+            if consecutive_player >= 2:
+                print("[INFO] Already sent follow-up, waiting...")
+                return
+            
+            print("[INFO] Sending follow-up...")
+            category = self._classify(last_msg["text"]) if last_msg["text"] else "casual"
+            await self._send_follow_up_with_excuse(category)
+        
+    async def _send_follow_up_with_excuse(self, category: str = "casual"):
+        """Send follow-up message."""
+        excuse = self.excuse_generator.generate_excuse(category)
+        
+        if excuse:
+            print(f"[INFO] Generated excuse: {excuse[:80]}...")
+            await self._type_response(excuse)
+            await self._send_response()
+        else:
+            fallbacks = [
+                "Hey, you still there? What are you thinking about?",
+                "Got quiet on me. What's on your mind?",
+                "Still around? Tell me something interesting."
+            ]
+            msg = random.choice(fallbacks)
+            print(f"[INFO] Fallback follow-up: {msg}")
+            await self._type_response(msg)
+            await self._send_response()
+        
+    async def _check_for_new_info(self, customer_msg: str):
+        """Check if customer asks for info."""
+        customer_lower = customer_msg.lower()
+        
+        if any(word in customer_lower for word in ["work", "job", "do for a living", "what do you do", "profession", "career"]):
+            existing_prof = self.logbook.get_player_profession()
+            
+            if existing_prof:
+                detail = self.logbook.get_profession_detail("detail")
+                if not detail:
+                    details = {
+                        "teacher": ["English teacher", "preschool teacher", "high school math teacher"],
+                        "doctor": ["general practitioner", "pediatrician", "nurse practitioner"],
+                        "student": ["part-time barista", "part-time retail", "part-time tutor"],
+                        "unemployed": ["between jobs", "looking for opportunities", "taking time off"]
+                    }
+                    base = existing_prof.lower()
+                    if base in details:
+                        detail = random.choice(details[base])
+                        self.logbook.set_profession(existing_prof, detail, self.customer_profile.get("name"))
+                        print(f"[INFO] Detailed profession: {detail}")
+            else:
+                professions = [
+                    ("teacher", "English teacher"),
+                    ("nurse", "pediatric nurse"),
+                    ("receptionist", "hotel receptionist"),
+                    ("waitress", "diner waitress"),
+                    ("student", "part-time barista")
+                ]
+                base, detail = random.choice(professions)
+                self.logbook.set_profession(base, detail, self.customer_profile.get("name"))
+                self.player_profile["occupation"] = detail
+                print(f"[INFO] Set profession: {detail}")
+        
+        if any(phrase in customer_lower for phrase in ["i am a", "i work as", "my job is", "i'm a"]):
+            patterns = [
+                r'i am a[n]? ([\w\s]+)',
+                r'i work as a[n]? ([\w\s]+)',
+                r'my job is ([\w\s]+)',
+                r'i\'m a[n]? ([\w\s]+)'
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, customer_lower)
+                if match:
+                    client_prof = match.group(1).strip()
+                    self.logbook.add_entry("Client_Work", f"Client profession: {client_prof}", self.customer_profile.get("name"))
+                    print(f"[INFO] Recorded client profession: {client_prof}")
+                    break
+        
+        if any(word in customer_lower for word in ["fantasy", "dream", "like to try", "never tried", "experience"]):
+            if "i've never" in customer_lower or "i want to" in customer_lower:
+                self.logbook.add_entry("Sexual", f"Customer shared: {customer_msg[:100]}", self.customer_profile.get("name"))
+        
+        if any(word in customer_lower for word in ["sick", "surgery", "medical", "health", "migraine", "glasses", "smoke"]):
+            self.logbook.add_entry("Health", f"Customer health info: {customer_msg[:100]}", self.customer_profile.get("name"))
+        
+        if "[Customer shared a photo:" in customer_msg:
+            photo_desc = customer_msg.split("[Customer shared a photo:")[1].split("]")[0]
+            self.logbook.add_entry("Update", f"Photo received: {photo_desc}", self.customer_profile.get("name"))
+            
+    async def _generate_response(self, last_msg: Dict, conversation: List[Dict], is_follow_up: bool = False):
+        """Generate response."""
+        recent = conversation[-15:]
+        category = self._classify(last_msg["text"]) if not is_follow_up else "casual"
+        
+        if is_follow_up:
+            print("[INFO] Generating follow-up message...")
+        
+        system_prompt = build_system_prompt(
+            rules=self.rules,
+            player_name=self.player_profile.get("name", "Player"),
+            player_occupation=self.player_profile.get("occupation", "Worker"),
+            player_location=self.player_profile.get("location"),
+            customer_name=self.customer_profile.get("name", "Customer"),
+            customer_location=self.customer_profile.get("location", "Unknown"),
+            logbook_summary=self._build_summary(),
+            category=category,
+            past_replies=[m["text"] for m in recent if m["speaker"] == "player"][-10:],
+            user_message=last_msg["text"],
+            is_follow_up=is_follow_up
+        )
+        
+        history = [{"role": "user" if m["speaker"] == "customer" else "assistant", "content": m["text"]} 
+                   for m in recent]
+        
+        result = self.deepseek.generate(system_prompt, history, user_message=last_msg["text"], temperature=0.95)
+        
+        if result["ok"]:
+            reply = result["text"]
+            print(f"[INFO] Bot: {reply[:80]}...")
+            await self._type_response(reply)
+            await self._send_response()
+        else:
+            print(f"[ERROR] {result['error']}")
+
+    async def _read_platform_history(self) -> List[Dict]:
+        """Read previous conversation history."""
+        messages = []
+        
+        try:
+            all_bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
+            
+            for bubble in all_bubbles:
+                try:
+                    classes = await bubble.get_attribute("class") or ""
+                    
+                    is_old = any(marker in classes for marker in ["old", "previous", "history", "past", "read-only", "archived"])
+                    
+                    if not is_old:
+                        continue
+                    
+                    text_elem = await bubble.query_selector(".message-content, .text")
+                    text = await text_elem.inner_text() if text_elem else ""
+                    
+                    if "customer" in classes or "client" in classes:
+                        speaker = "customer"
+                    elif "entertainment" in classes or "player" in classes or "operator" in classes:
+                        speaker = "player"
+                    else:
+                        continue
+                    
+                    if text.strip():
+                        messages.append({
+                            "speaker": speaker,
+                            "text": text.strip(),
+                            "is_historical": True
+                        })
+                        
+                except:
+                    continue
+                    
+        except Exception as e:
+            print(f"[WARNING] Failed to read platform history: {e}")
+        
+        if messages:
+            print(f"[INFO] Loaded {len(messages)} messages from platform history")
+            
+        return messages
+    
+    async def _extract_facts_from_history(self, history: List[Dict]):
+        """Scan previous conversation for facts."""
+        player_messages = [m["text"] for m in history if m["speaker"] == "player"]
+        
+        for msg in player_messages:
+            msg_lower = msg.lower()
+            
+            if any(phrase in msg_lower for phrase in ["i am a", "i'm a", "i work as", "my job is"]):
+                patterns = [
+                    r'i am a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'i\'m a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'i work as a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'my job is ([\w\s]+?)(?:\.|$)'
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, msg_lower)
+                    if match:
+                        job = match.group(1).strip()
+                        if not self.logbook.get_player_profession():
+                            self.logbook.set_profession(job, client=self.customer_profile.get("name"))
+                            print(f"[INFO] Extracted profession from history: {job}")
+                        break
+            
+            if "i live in" in msg_lower or "i'm from" in msg_lower or "i am from" in msg_lower:
+                patterns = [
+                    r'i live in ([\w\s,]+?)(?:\.|$)',
+                    r'i\'m from ([\w\s,]+?)(?:\.|$)',
+                    r'i am from ([\w\s,]+?)(?:\.|$)'
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, msg_lower)
+                    if match:
+                        loc = match.group(1).strip()
+                        self.logbook.add_entry("Work", f"Location mentioned: {loc}", self.customer_profile.get("name"))
+                        print(f"[INFO] Extracted location from history: {loc}")
+                        break
+
+    def _build_summary(self) -> str:
+        """Build summary from profiles + logbook."""
+        parts = []
+        
+        if self.player_profile.get("age"):
+            parts.append(f"Player Age: {self.player_profile['age']}")
+        if self.player_profile.get("occupation"):
+            parts.append(f"Player Work: {self.player_profile['occupation']}")
+        if self.player_profile.get("location"):
+            parts.append(f"Player Location: {self.player_profile['location']}")
+        if self.player_profile.get("about"):
+            parts.append(f"Player Bio: {self.player_profile['about'][:100]}")
+        
+        if self.customer_profile.get("age"):
+            parts.append(f"Customer Age: {self.customer_profile['age']}")
+        if self.customer_profile.get("about_me"):
+            parts.append(f"Customer: {self.customer_profile['about_me'][:80]}")
+        
+        entries = self.logbook.all_entries()[-5:]
+        for e in entries:
+            parts.append(f"[{e['category']}] {e['comment'][:60]}")
+        
+        return "\n".join(parts) if parts else "(No profile data)"
+        
+    async def _read_conversation_history(self) -> List[Dict]:
+        """Read all messages including image detection."""
+        messages = []
+        bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
+        
+        for bubble in bubbles:
+            try:
+                classes = await bubble.get_attribute("class") or ""
+                
+                if "message-customer" in classes or "customer" in classes:
+                    speaker = "customer"
+                elif "message-entertainment" in classes or "entertainment" in classes:
+                    speaker = "player"
+                else:
+                    continue
+                
+                text_elem = await bubble.query_selector(".message-content, .text")
+                text = await text_elem.inner_text() if text_elem else ""
+                
+                image_elem = await bubble.query_selector("img, .message-image, [data-testid='messageImage']")
+                if image_elem and speaker == "customer":
+                    image_url = await image_elem.get_attribute("src")
+                    if image_url:
+                        print(f"[INFO] Customer sent image")
+                        image_desc = await self._analyze_image(image_url)
+                        text += f" [Customer shared a photo: {image_desc}]"
+                
+                if text.strip():
+                    messages.append({"speaker": speaker, "text": text.strip()})
+                    
+            except Exception as e:
+                continue
+        
+        return messages
+    
+    async def _analyze_image(self, image_url: str) -> str:
+        """Analyze image using OpenAI Vision if enabled."""
+        if not self.openai_enabled:
+            return "photo"
+        
+        try:
+            js_code = """
+                async () => {
+                    const res = await fetch("%s");
+                    const blob = await res.blob();
+                    return new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+                }
+            """ % image_url
+            
+            response = await self.page.evaluate(js_code)
+            
+            if response and ',' in response:
+                base64_data = response.split(',')[1]
+                
+                import openai
+                client = openai.AsyncOpenAI(api_key=self.openai_key)
+                
+                result = await client.chat.completions.create(
+                    model="gpt-4-vision-preview",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image briefly and compliment what you see. If it's a person/selfie/nude, be flattering and appreciative. Keep it under 20 words."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_data}"}}
+                        ]
+                    }],
+                    max_tokens=60
+                )
+                
+                desc = result.choices[0].message.content
+                print(f"[INFO] Image analysis: {desc[:60]}...")
+                return desc
+                
+        except Exception as e:
+            print(f"[WARNING] Image analysis failed: {e}")
+        
+        return "photo"
+    
+    async def _type_response(self, text: str):
+        """Type like a human - slower, irregular, to avoid copy-paste detection."""
+        # Ensure input is visible first (NEW - fixes view issue)
+        await self._ensure_input_visible()
+        
+        # Find input box
+        input_selectors = [
+            "[data-testid='messageTextArea']",
+            ".chat-input",
+            "textarea",
+            "[contenteditable='true']"
+        ]
+        
+        input_box = None
+        for selector in input_selectors:
+            try:
+                input_box = await self.page.query_selector(selector)
+                if input_box:
+                    await input_box.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.5)
+                    await input_box.click()
+                    break
+            except:
+                continue
+        
+        if not input_box:
+            print("[ERROR] Could not find input box")
+            return
+        
+        # Clear existing text naturally
+        await self.page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await self.page.keyboard.press("Delete")
+        await asyncio.sleep(0.3)
+        
+        # TYPE LIKE A HUMAN (fixes copy-paste warning)
+        print(f"[INFO] Typing {len(text)} characters...")
+        
+        words = text.split()
+        for i, word in enumerate(words):
+            # Type each character with human delay (80-250ms)
+            for char in word:
+                delay = random.uniform(80, 250)
+                await self.page.keyboard.type(char, delay=delay)
+                
+                # Occasional longer pause (thinking)
+                if random.random() < 0.05:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+            
+            # Space between words
+            if i < len(words) - 1:
+                await self.page.keyboard.type(" ", delay=random.uniform(50, 150))
+                
+                # Occasional pause between words
+                if random.random() < 0.1:
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+        
+        print("[INFO] Finished typing")
+        
+    async def _send_response(self):
+        if self.dry_run:
+            print("[DRY RUN] Review and press Enter...")
+            input()
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Delete")
+            return
+        
+        # Try multiple send button selectors
+        send_selectors = [
+            "[data-testid='sendChatMessageButton']",
+            ".send-button",
+            "button[type='submit']",
+            "button:has-text('Send')",
+            "button.send"
+        ]
+        
+        sent = False
+        for selector in send_selectors:
+            try:
+                await self.page.click(selector, timeout=2000)
+                sent = True
+                print("[INFO] Sent")
+                break
+            except:
+                continue
+        
+        if not sent:
+            # Fallback: press Enter key
+            await self.page.keyboard.press("Enter")
+            print("[INFO] Sent (using Enter key)")
+        
+        # Scroll after sending
+        await self._scroll_to_bottom()
+        
+    def _classify(self, text: str) -> str:
+        t = text.lower()
+        if any(k in t for k in ["sex", "fuck", "cock", "pussy"]):
+            return "sexual"
+        if any(k in t for k in ["sexy", "beautiful", "kiss"]):
+            return "flirty"
+        return "casual"
+        
+    async def _wait_for_assignment(self) -> bool:
+        try:
+            await self.page.wait_for_selector(".message-blob, .chat-message", timeout=10000)
+            await self._scroll_to_bottom()
+            return True
+        except:
+            return False
+            
+    async def _wait_for_chat_close(self):
+        for _ in range(60):
+            chat = await self.page.query_selector(".message-blob")
+            if not chat:
+                return True
+            await asyncio.sleep(1)
+        return True
+        
+    async def _check_balance(self):
+        balance = self.deepseek.check_balance()
+        print(f"[INFO] DeepSeek balance: ${balance:.2f}")
+        
+        if balance < 4.0 and self.telegram_enabled and self.notifier:
+            try:
+                self.notifier.notify_low_balance(self.telegram_user_id, balance, 4.0)
+            except Exception as e:
+                print(f"[WARNING] Failed to send Telegram: {e}")
+        
+    async def _login(self):
+        """Login to chathomebase."""
+        print("[INFO] Logging in...")
+        
+        try:
+            await self.page.goto("https://chathomebase.com/login")
+            
+            await self.page.fill("input[name='email']", self.settings["chathomebase_login"])
+            await self.page.fill("input[name='password']", self.settings["chathomebase_password"])
+            
+            await self.page.click("[data-testid='signInButton']")
+            
+            await self.page.wait_for_url("**/chat/lobby", timeout=30000)
+            
+            print("[INFO] Successfully logged in")
+            
+        except Exception as e:
+            current_url = self.page.url
+            print(f"[ERROR] Login failed. Current URL: {current_url}")
+            print(f"[ERROR] Timeout waiting for /chat/lobby: {e}")
+            raise
+        
+        for _ in range(5):
+            try:
+                await self.page.click("[data-testid='announcementsDialogNextButton']", timeout=2000)
+                await asyncio.sleep(0.5)
+            except:
+                break
+        try:
+            await self.page.click("[data-testid='announcementsDialogContinueButton']", timeout=2000)
+        except:
+            pass
+            
+        print("[INFO] Ready for assignments")
+        return True
+        
+    async def stop(self):
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+
+async def run_web_bot(settings: dict, dry_run: bool = False):
+    adapter = ChatHomeBaseAdapter(settings, dry_run=dry_run)
+    try:
+        await adapter.start()
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopped")
+    finally:
+        await adapter.stop()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\bootstrap\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\bootstrap\first_run_wizard.py ===
+"""First-run setup wizard for LIVE web platform."""
+
+from pathlib import Path
+from rich.console import Console
+from rich.prompt import Prompt, Confirm
+from rich.panel import Panel
+from rich.rule import Rule
+
+console = Console()
+
+
+def run_wizard(config_file: Path):
+    """Run setup wizard for live web platform."""
+    console.print(Panel.fit(
+        "[bold cyan]ChatHomeBase Bot Setup[/bold cyan]\n"
+        "Live Platform Version - Profiles auto-scraped from website",
+        title="Welcome",
+        border_style="cyan"
+    ))
+    
+    # Check if updating existing
+    existing = {}
+    if config_file.exists():
+        from config.settings import load_settings
+        existing = load_settings(config_file)
+        console.print("[yellow]Updating existing configuration...[/yellow]\n")
+    
+    console.rule("[bold]Your DeepSeek API Key[/bold]")
+    console.print("Each user needs their own DeepSeek API key.")
+    console.print("Get yours from: [cyan]platform.deepseek.com[/cyan]")
+    deepseek_key = Prompt.ask("DeepSeek API key", 
+                               default=existing.get("deepseek_api_key", "")).strip()
+    
+    console.rule("[bold]ChatHomeBase Credentials[/bold]")
+    chb_email = Prompt.ask("ChatHomeBase email", 
+                          default=existing.get("chathomebase_login", "")).strip()
+    chb_password = Prompt.ask("ChatHomeBase password", 
+                               password=True).strip()
+    
+   # Optional: Proxy
+    console.rule("[bold]Proxy (Optional)[/bold]")
+    use_proxy = Confirm.ask("Use proxy?", default=False)
+    proxy = None
+    if use_proxy:
+        console.print("Formats accepted:")
+        console.print("  - URL: http://user:pass@host:port")
+        console.print("  - IP format: 1.2.3.4:8080:user:pass")
+        proxy_input = Prompt.ask("Proxy server").strip()
+        
+        if proxy_input:
+            # Check if it's IP:Port:User:Pass format
+            if proxy_input.count(":") >= 3 and not proxy_input.startswith("http"):
+                # Convert 1.2.3.4:8080:user:pass to http://user:pass@1.2.3.4:8080
+                parts = proxy_input.split(":")
+                if len(parts) >= 4:
+                    ip = parts[0]
+                    port = parts[1]
+                    username = parts[2]
+                    password = ":".join(parts[3:])  # Password might contain colons
+                    proxy_url = f"http://{username}:{password}@{ip}:{port}"
+                    proxy = {"server": proxy_url}
+                    console.print(f"[green]Converted to: {proxy_url}[/green]")
+            else:
+                # Already in URL format
+                proxy = {"server": proxy_input}
+    
+    # Optional: Telegram notifications
+    console.rule("[bold]Telegram Notifications (Optional)[/bold]")
+    use_telegram = Confirm.ask("Enable Telegram low-balance alerts?", default=False)
+    
+    telegram_token = None
+    telegram_user_id = None
+    
+    if use_telegram:
+        console.print("Get your bot token from @BotFather")
+        telegram_token = Prompt.ask("Telegram bot token").strip()
+        console.print("Get your user ID from @userinfobot")
+        telegram_user_id = Prompt.ask("Telegram user ID").strip()
+    
+    # Optional: OpenAI for vision
+    console.rule("[bold]Image Analysis (Optional)[/bold]")
+    use_vision = Confirm.ask("Enable image analysis? (Requires OpenAI API key)", default=False)
+    
+    openai_key = None
+    if use_vision:
+        console.print("Get your key from: [cyan]platform.openai.com[/cyan]")
+        openai_key = Prompt.ask("OpenAI API key").strip()
+    
+    # Build settings
+    settings = {
+        **existing,
+        "deepseek_api_key": deepseek_key,
+        "chathomebase_login": chb_email,
+        "chathomebase_password": chb_password,
+        "proxy": proxy,
+        "telegram_bot_token": telegram_token,
+        "telegram_user_id": telegram_user_id,
+        "openai_api_key": openai_key,
+        "deepseek_low_balance_threshold_usd": 4.0,
+    }
+    
+    # Save
+    from config.settings import save_settings
+    save_settings(config_file, settings)
+    
+    console.print("\n[green]✓ Setup complete![/green]")
+    console.print("[cyan]Player and customer profiles will be auto-scraped from chathomebase.com[/cyan]")
+    if proxy:
+        console.print(f"[yellow]Proxy configured: {proxy['server']}[/yellow]")
+    console.print("Run [bold]LAUNCH.bat[/bold] to start the bot.\n")
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from pathlib import Path
+    run_wizard(Path("config/settings.json"))
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\config\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\config\settings.py ===
+"""Settings management."""
+
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_settings(config_file: Path) -> dict:
+    """Load settings with shared Google key."""
+    settings = _load_json(config_file) if config_file.exists() else {}
+    
+    # Load shared Google key from separate file
+    google_key_file = config_file.parent / "google_key.txt"
+    if google_key_file.exists():
+        settings["google_api_key"] = google_key_file.read_text().strip()
+    
+    return settings
+
+
+def save_settings(config_file: Path, settings: dict) -> None:
+    """Save settings (without Google key - that's in separate file)."""
+    settings_to_save = {k: v for k, v in settings.items() if k != "google_api_key"}
+    _save_json(config_file, settings_to_save)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\deepseek_client.py ===
+"""DeepSeek API client with guard integration."""
+
+import requests
+import json
+from typing import Dict, List, Optional
+
+
+class DeepSeekClient:
+    """Client for DeepSeek API with retry logic."""
+    
+    def __init__(self, api_key: str, guard=None, low_balance_threshold_usd: float = 4.0, max_retries: int = 3):
+        self.api_key = api_key
+        self.guard = guard
+        self.low_balance_threshold = low_balance_threshold_usd
+        self.max_retries = max_retries
+        self.base_url = "https://api.deepseek.com/v1"
+        self._balance_cache = None
+        self._balance_time = 0
+        
+    def check_balance(self) -> float:
+        """Check DeepSeek account balance."""
+        import time
+        if time.time() - self._balance_time < 60 and self._balance_cache is not None:
+            return self._balance_cache
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}/user/balance",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # DeepSeek returns balance in balance_infos array
+                if "balance_infos" in data and len(data["balance_infos"]) > 0:
+                    balance_info = data["balance_infos"][0]
+                    balance = float(balance_info.get("total_balance", 0))
+                    self._balance_cache = balance
+                    self._balance_time = time.time()
+                    return balance
+                else:
+                    print(f"[WARNING] Unexpected balance format")
+                    return 0.0
+            else:
+                print(f"[ERROR] Balance check failed: {response.status_code}")
+                
+        except Exception as e:
+            print(f"[ERROR] Balance check exception: {e}")
+        
+        return self._balance_cache or 0.0
+        
+    def generate(self, system_prompt: str, history: List[Dict], user_message: str, temperature: float = 0.95) -> Dict:
+        """Generate response with retries and guard checking."""
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": 150
+                    },
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data["choices"][0]["message"]["content"].strip()
+                    
+                    # Apply guard if available
+                    if self.guard:
+                        text = self.guard.filter(text)
+                    
+                    return {"ok": True, "text": text}
+                    
+                elif response.status_code == 429:
+                    import time
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return {"ok": False, "error": f"API error {response.status_code}: {response.text}"}
+                    
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return {"ok": False, "error": str(e)}
+                import time
+                time.sleep(1)
+        
+        return {"ok": False, "error": "Max retries exceeded"}
+
+        
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\excuse_bank.py ===
+"""Dynamic excuse generator using DeepSeek AI — aligned with player persona."""
+
+import random
+from typing import List, Optional
+
+
+class DynamicExcuseGenerator:
+    """Generates unique, persona-aligned excuses on-demand."""
+    
+    PERSONA_SCENARIOS = {
+        "store attendant": [
+            "restocking shelves", "helping a difficult customer", "counting inventory",
+            "cleaning up a spill", "unlocking the storage room", "organizing the back room",
+            "price-checking an item", "assisting with returns", "restocking the cooler",
+            "dealing with a broken scanner", "helping find a product", "cleaning the aisles",
+            "restocking register tape", "organizing the display", "checking expiration dates"
+        ],
+        "teacher": [
+            "grading papers", "preparing lesson plans", "talking to a parent",
+            "helping a student after class", "organizing classroom supplies", "filling out reports",
+            "setting up a projector", "finding lost homework", "calming down a student"
+        ],
+        "nurse": [
+            "checking on a patient", "filling out charts", "restocking medical supplies",
+            "talking to a doctor", "calming a family member", "organizing the supply closet"
+        ],
+        "waitress": [
+            "taking a large order", "cleaning up a table", "helping in the kitchen",
+            "restocking napkins", "dealing with a difficult customer", "balancing the register"
+        ],
+        "receptionist": [
+            "answering phones", "scheduling appointments", "organizing files",
+            "greeting a client", "fixing the printer", "restocking office supplies"
+        ],
+        "barista": [
+            "making a complicated order", "restocking coffee beans", "cleaning the espresso machine",
+            "wiping down the counter", "organizing the pastry display", "grinding fresh beans"
+        ],
+        "bartender": [
+            "mixing a complicated drink", "restocking the liquor shelf", "cleaning glasses",
+            "wiping down the bar", "checking IDs", "organizing the cooler"
+        ],
+        "hair stylist": [
+            "mixing hair color", "cleaning up cut hair", "organizing styling products",
+            "washing towels", "setting up a station", "finding the right tool"
+        ],
+        "fitness instructor": [
+            "setting up equipment", "wiping down machines", "organizing the weight room",
+            "finding the right music", "cleaning yoga mats", "restocking water bottles"
+        ],
+        "default": [
+            "organizing my workspace", "dealing with a technical issue", "restocking supplies",
+            "cleaning up a mess", "finding something I misplaced", "helping a colleague"
+        ]
+    }
+    
+    def __init__(self, deepseek_client, player_occupation: str = ""):
+        self.deepseek = deepseek_client
+        self.player_occupation = player_occupation.lower()
+        self.used_excuses: List[str] = []
+        self.used_phrases: set = set()
+        self.scenarios = self._get_scenarios()
+        
+    def _get_scenarios(self) -> List[str]:
+        for occupation, scenarios in self.PERSONA_SCENARIOS.items():
+            if occupation in self.player_occupation:
+                return scenarios
+        return self.PERSONA_SCENARIOS["default"]
+    
+    def generate_excuse(self, category: str, used: List[str] = None) -> Optional[str]:
+        if used:
+            self.used_excuses.extend(used)
+        
+        scenario = random.choice(self.scenarios)
+        
+        tone_instructions = {
+            "casual": f"warm and friendly. Mention: {scenario}",
+            "flirty": f"playful and teasing with light innuendo. Mention being distracted by: {scenario}",
+            "sexual": f"explicit and erotic. Connect {scenario} to sexual thoughts"
+        }
+        
+        tone = tone_instructions.get(category, tone_instructions["casual"])
+        
+        used_summary = ""
+        if self.used_excuses:
+            recent = self.used_excuses[-5:]
+            used_summary = "AVOID these scenarios:\n" + "\n".join(f"- {e[:60]}..." for e in recent)
+        
+        prompt = f"""You are a {self.player_occupation}. Write a short excuse (160-260 characters) explaining why you were delayed.
+
+SCENARIO: {scenario}
+TONE: {tone}
+
+REQUIREMENTS:
+- Sound natural for a {self.player_occupation}
+- Reference the scenario authentically
+- End with open-ended question
+- NO em dashes, NO exclamation marks, NO filler sounds
+- COMPLETELY different from previous excuses
+
+{used_summary}
+
+Write ONE excuse:"""
+        
+        result = self.deepseek.generate(
+            system_prompt=prompt,
+            history=[{"role": "user", "content": "Generate excuse"}],
+            user_message="",
+            temperature=0.7
+        )
+        
+        if result["ok"]:
+            excuse = result["text"].strip()
+            if 150 <= len(excuse) <= 300 and self._is_unique_enough(excuse):
+                self.used_excuses.append(excuse)
+                self._extract_phrases(excuse)
+                return excuse
+        
+        return self._fallback_excuse(category, scenario)
+    
+    def _is_unique_enough(self, excuse: str) -> bool:
+        excuse_lower = excuse.lower()
+        if excuse_lower in [e.lower() for e in self.used_excuses]:
+            return False
+        
+        words = excuse_lower.split()
+        for i in range(len(words) - 2):
+            phrase = " ".join(words[i:i+3])
+            if phrase in self.used_phrases:
+                return False
+        return True
+    
+    def _extract_phrases(self, text: str):
+        words = text.lower().split()
+        for i in range(len(words) - 2):
+            phrase = " ".join(words[i:i+3])
+            self.used_phrases.add(phrase)
+    
+    def _fallback_excuse(self, category: str, scenario: str) -> str:
+        templates = {
+            "store attendant": {
+                "casual": [
+                    f"Got caught up {scenario} and lost track of time. What have you been up to?",
+                    f"Had to stop and deal with {scenario}. What's something that interrupted your day recently?",
+                    f"Got distracted by {scenario}. When's the last time you got completely sidetracked?"
+                ],
+                "flirty": [
+                    f"Was {scenario} and kept imagining you watching me. What do you picture me doing right now?",
+                    f"Got distracted {scenario} and started thinking about your hands on me. Where would you touch me first?"
+                ],
+                "sexual": [
+                    f"Was {scenario} and started touching myself thinking about you. How hard are you right now?",
+                    f"Got distracted {scenario} and my panties got soaked imagining you. What would you do if you saw?"
+                ]
+            }
+        }
+        
+        occupation_key = None
+        for occ in self.PERSONA_SCENARIOS.keys():
+            if occ in self.player_occupation:
+                occupation_key = occ
+                break
+        
+        if occupation_key and occupation_key in templates:
+            options = templates[occupation_key].get(category, templates[occupation_key]["casual"])
+        else:
+            options = {
+                "casual": [f"Got caught up with {scenario}. What have you been up to?"],
+                "flirty": [f"Was {scenario} and started thinking about you. What do you picture me doing?"],
+                "sexual": [f"Was {scenario} and started touching myself thinking about you. How hard are you?"]
+            }.get(category, [f"Got caught up with {scenario}. What have you been up to?"])
+        
+        for option in options:
+            if option.lower() not in [e.lower() for e in self.used_excuses]:
+                self.used_excuses.append(option)
+                return option
+        
+        base = random.choice(options)
+        modifiers = [" just now", " a few minutes ago", " earlier"]
+        return base + random.choice(modifiers)
+    
+    def clear_history(self):
+        self.used_excuses = []
+        self.used_phrases = set()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\google_geo.py ===
+"""Google Geocoding API client."""
+
+import requests
+from typing import Optional
+
+
+class LocationFinder:
+    """Find location using Google Geocoding API."""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://maps.googleapis.com/maps/api/geocode/json"
+    
+    def get_city_from_location(self, location: str) -> Optional[str]:
+        """Extract city from location string."""
+        try:
+            response = requests.get(
+                self.base_url,
+                params={
+                    "address": location,
+                    "key": self.api_key
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("results"):
+                    # Extract city from address components
+                    for component in data["results"][0]["address_components"]:
+                        if "locality" in component.get("types", []):
+                            return component["long_name"]
+                        if "administrative_area_level_2" in component.get("types", []):
+                            return component["long_name"]
+                    
+                    # Fallback to formatted address
+                    return data["results"][0]["formatted_address"].split(",")[0]
+                    
+        except Exception as e:
+            print(f"[WARNING] Geocoding failed: {e}")
+        
+        return None
+    
+    def get_nearby_city(self, location: str, max_distance_miles: int = 50) -> Optional[str]:
+        """Find a city near the given location."""
+        # Simplified - just return the city for now
+        return self.get_city_from_location(location)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\logbook.py ===
+"""Logbook for tracking invented details with categories."""
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
+
+
+class Logbook:
+    """Tracks invented personal details for consistency across customers."""
+    
+    CATEGORIES = [
+        "Work",           # Player's profession details
+        "Sexual",         # Fantasies, preferences, experiences  
+        "Health",         # Health issues, conditions
+        "Update",         # Appointments, events, photos received
+        "Client_Work",    # Customer's profession
+        "Other"           # Anything else
+    ]
+    
+    def __init__(self, log_dir: Path, customer_name: str):
+        self.log_dir = log_dir
+        self.customer_name = customer_name
+        self.log_file = log_dir / f"{customer_name}_{datetime.now().strftime('%Y%m%d')}.json"
+        self.entries: List[Dict] = []
+        self.player_facts: Dict[str, str] = {}  # Global player facts across all customers
+        self._load()
+        self._load_global_facts()
+    
+    def _load(self):
+        """Load existing logbook for this customer."""
+        try:
+            if self.log_file.exists():
+                with open(self.log_file, 'r') as f:
+                    self.entries = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load logbook: {e}")
+            self.entries = []
+    
+    def _load_global_facts(self):
+        """Load global player facts across all customers."""
+        global_file = self.log_dir / "player_facts.json"
+        try:
+            if global_file.exists():
+                with open(global_file, 'r') as f:
+                    self.player_facts = json.load(f)
+        except:
+            self.player_facts = {}
+    
+    def _save_global_facts(self):
+        """Save global player facts."""
+        global_file = self.log_dir / "player_facts.json"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with open(global_file, 'w') as f:
+                json.dump(self.player_facts, f, indent=2)
+        except Exception as e:
+            print(f"[WARNING] Failed to save global facts: {e}")
+    
+    def add_entry(self, category: str, comment: str, client: str = None):
+        """Add entry to logbook."""
+        if category not in self.CATEGORIES:
+            category = "Other"
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "category": category,
+            "comment": comment,
+            "client": client or self.customer_name
+        }
+        self.entries.append(entry)
+        self._save()
+        
+        # If it's a player work fact, save globally
+        if category == "Work" and ":" in comment:
+            key = comment.split(":")[0].strip().lower()
+            value = comment.split(":", 1)[1].strip() if ":" in comment else comment
+            self.player_facts[key] = value
+            self._save_global_facts()
+    
+    def get_player_profession(self) -> Optional[str]:
+        """Get player's established profession."""
+        return self.player_facts.get("profession")
+    
+    def get_profession_detail(self, detail_type: str) -> Optional[str]:
+        """Get specific profession detail."""
+        return self.player_facts.get(f"profession_{detail_type}")
+    
+    def set_profession(self, base: str, detail: str = None, client: str = None):
+        """Set player's profession."""
+        self.player_facts["profession"] = base
+        if detail:
+            self.player_facts["profession_detail"] = detail
+        
+        comment = f"Profession: {base}"
+        if detail:
+            comment += f" - {detail}"
+        
+        self.add_entry("Work", comment, client)
+        self._save_global_facts()
+    
+    def get_facts_by_category(self, category: str) -> List[Dict]:
+        """Get all entries for a category."""
+        return [e for e in self.entries if e["category"] == category]
+    
+    def get_summary_for_prompt(self) -> str:
+        """Build summary for AI prompt."""
+        lines = []
+        
+        # Work/Profession
+        prof = self.get_player_profession()
+        if prof:
+            detail = self.get_profession_detail("detail")
+            lines.append(f"Work: {prof}" + (f" ({detail})" if detail else ""))
+        
+        # Recent entries by category
+        for cat in ["Sexual", "Health", "Update"]:
+            entries = self.get_facts_by_category(cat)[-3:]
+            for e in entries:
+                lines.append(f"{cat}: {e['comment'][:80]}")
+        
+        return "\n".join(lines) if lines else "No established facts yet."
+    
+    def _save(self):
+        """Save logbook."""
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.log_file, 'w') as f:
+                json.dump(self.entries, f, indent=2)
+        except Exception as e:
+            print(f"[WARNING] Failed to save logbook: {e}")
+    
+    def all_entries(self) -> List[Dict]:
+        """Get all entries."""
+        return self.entries
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\prompt_builder.py ===
+"""Build system prompts for DeepSeek."""
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+def load_rules(rules_file: Path) -> Dict:
+    """Load rules from JSON file."""
+    try:
+        with open(rules_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARNING] Failed to load rules: {e}")
+        return {}
+
+
+def build_system_prompt(
+    rules: Dict,
+    player_name: str,
+    player_occupation: str,
+    player_location: Optional[str],
+    customer_name: str,
+    customer_location: str,
+    logbook_summary: str,
+    category: str,
+    past_replies: List[str],
+    user_message: str,
+    is_follow_up: bool = False
+) -> str:
+    """Build system prompt for DeepSeek."""
+    
+    follow_up_instruction = ""
+    if is_follow_up:
+        follow_up_instruction = "\nThe customer hasn't replied. Send a short, flirty follow-up (10-15 words) to re-engage them."
+    
+    # Profession consistency warning
+    profession_warning = ""
+    if player_occupation and player_occupation != "Worker":
+        profession_warning = f"\nIMPORTANT: You are a {player_occupation}. Never claim a different profession. You can elaborate but cannot change it."
+    
+    prompt = f"""You are {player_name}, a {player_occupation} from {player_location or 'a small town'}.
+
+STRICT RULES:
+- Minimum 150 characters per response
+- Maximum 500 characters per response{profession_warning}
+- Never share phone, email, or social media
+- Never suggest meeting in person
+- Always ask a question to keep conversation going
+
+Your established facts (NEVER contradict these):
+{logbook_summary}
+
+You are chatting with {customer_name} from {customer_location}.
+Customer just said: "{user_message}"
+
+{follow_up_instruction}
+
+Respond naturally as {player_name}. Be engaging, flirty, and make them want to reply."""
+
+    return prompt
+
+
+def build_history_messages(conversation: List[Dict]) -> List[Dict]:
+    """Convert conversation to DeepSeek format."""
+    return [
+        {"role": "user" if m["speaker"] == "customer" else "assistant", "content": m["text"]}
+        for m in conversation
+    ]
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\rule_guard.py ===
+"""Post-generation rule guard."""
+
+import json
+import re
+from pathlib import Path
+from typing import List, Optional
+
+
+class RuleGuard:
+    """Filters and guards bot responses."""
+    
+    def __init__(self, rules_file: Path, banned_file: Path, customer_first_name: str = "Customer"):
+        self.rules_file = rules_file
+        self.banned_file = banned_file
+        self.customer_first_name = customer_first_name
+        self.banned_phrases: List[str] = []
+        self.replacement_map: Dict[str, str] = {}
+        
+        self._load_banned()
+        
+    def _load_banned(self):
+        """Load banned phrases."""
+        try:
+            if self.banned_file.exists():
+                with open(self.banned_file, 'r') as f:
+                    self.banned_phrases = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load banned phrases: {e}")
+            self.banned_phrases = []
+    
+    def set_customer_name(self, name: str):
+        """Update customer first name."""
+        self.customer_first_name = name.split()[0] if name else "Customer"
+    
+    def filter(self, text: str) -> str:
+        """Filter response text."""
+        # Check banned phrases
+        for phrase in self.banned_phrases:
+            if phrase.lower() in text.lower():
+                print(f"[GUARD] Banned phrase detected: {phrase}")
+                text = text.replace(phrase, "[removed]")
+        
+        # Ensure customer name is correct
+        # (This would be customized based on your rules)
+        
+        return text.strip()
+    
+    def check_response(self, text: str, customer_msg: str) -> tuple[bool, Optional[str]]:
+        """Check if response violates rules."""
+        # Check for banned content
+        for phrase in self.banned_phrases:
+            if phrase.lower() in text.lower():
+                return False, f"Contains banned phrase: {phrase}"
+        
+        return True, None
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\timer_calculator.py ===
+"""Timer utilities for response timing."""
+
+import random
+
+
+class TimerCalculator:
+    """Calculate appropriate response delays."""
+    
+    def __init__(self):
+        self.base_typing_speed = 0.05  # seconds per character
+    
+    def calculate_typing_delay(self, text_length: int) -> float:
+        """Calculate realistic typing time."""
+        return text_length * self.base_typing_speed + random.uniform(0.5, 1.5)
+    
+    def get_response_delay(self) -> float:
+        """Get random delay before responding."""
+        return random.uniform(1.0, 3.0)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\data\banned_phrases.json ===
+[
+  "phone number",
+  "email me",
+  "text me",
+  "outside this platform",
+  "real name",
+  "actual location",
+  "meet up",
+  "in person",
+  "facebook",
+  "instagram",
+  "snapchat",
+  "whatsapp",
+  "telegram",
+  "kik",
+  "skype",
+  "discord"
+]
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\data\rules.json ===
+{
+  "profession_rules": {
+    "single_profession": true,
+    "can_elaborate": true,
+    "can_add_details": true,
+    "cannot_change": true,
+    "examples": {
+      "teacher": [
+        "English teacher",
+        "preschool teacher",
+        "high school teacher"
+      ],
+      "doctor": ["general practitioner", "pediatrician", "nurse"],
+      "student": ["part-time barista", "part-time retail", "part-time waitress"]
+    }
+  },
+  "logbook_categories": [
+    "Work",
+    "Sexual",
+    "Health",
+    "Update",
+    "Client_Work",
+    "Other"
+  ],
+  "response_limits": {
+    "min_characters": 150,
+    "max_characters": 500
+  },
+  "forbidden": {
+    "contact_info": ["phone", "email", "social media", "meet up"],
+    "external_platforms": [
+      "facebook",
+      "instagram",
+      "snapchat",
+      "whatsapp",
+      "telegram",
+      "kik",
+      "skype"
+    ]
+  }
+}
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\launch_bot.py ===
+#!/usr/bin/env python3
+"""Launch bot with web automation."""
+
+import asyncio
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config.settings import load_settings
+from adapters.web_platform import run_web_bot
+
+
+def main():
+    config_file = Path(__file__).parent / "config" / "settings.json"
+    
+    if not config_file.exists():
+        print("ERROR: Account not configured. Run SETUP.bat first.")
+        sys.exit(1)
+    
+    settings = load_settings(config_file)
+    
+    # Check required settings
+    required = ["deepseek_api_key", "chathomebase_login", "chathomebase_password"]
+    missing = [k for k in required if not settings.get(k)]
+    if missing:
+        print(f"ERROR: Missing settings: {', '.join(missing)}")
+        print("Run SETUP.bat to configure.")
+        sys.exit(1)
+    
+    # Run bot - LIVE MODE (sends messages automatically)
+    try:
+        asyncio.run(run_web_bot(settings, dry_run=False))
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopped by user")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        input("Press Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\adapters\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\adapters\web_platform.py ===
+"""Web automation for chathomebase.com — Auto-assignment with profile scraping."""
+
+import asyncio
+import json
+import re
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+
+from core.deepseek_client import DeepSeekClient
+from core.rule_guard import RuleGuard
+from core.logbook import Logbook
+from core.prompt_builder import load_rules, build_system_prompt, build_history_messages
+from core.excuse_bank import DynamicExcuseGenerator
+
+
+class ChatHomeBaseAdapter:
+    """Auto-assignment bot that scrapes profiles from platform."""
+    
+    def __init__(self, settings: dict, dry_run: bool = False):
+        self.settings = settings
+        self.dry_run = dry_run
+        
+        # Parse proxy if provided
+        self.proxy = settings.get("proxy")
+        self.proxy_config = None
+        if self.proxy and self.proxy.get("server"):
+            proxy_url = self.proxy["server"]
+            if "@" in proxy_url:
+                parsed = urlparse(proxy_url)
+                self.proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password
+                }
+            else:
+                self.proxy_config = {"server": proxy_url}
+        
+        # Bot brain
+        data_dir = Path(__file__).parent.parent / "data"
+        log_dir = Path(__file__).parent.parent / "logs" / "logbooks"
+        
+        self.rules = load_rules(data_dir / "rules.json")
+        self.guard = RuleGuard(
+            data_dir / "rules.json",
+            data_dir / "banned_phrases.json",
+            "Customer"
+        )
+        self.deepseek = DeepSeekClient(
+            api_key=settings["deepseek_api_key"],
+            guard=self.guard,
+            low_balance_threshold_usd=settings.get("deepseek_low_balance_threshold_usd", 4.0),
+            max_retries=3
+        )
+        self.logbook = Logbook(log_dir, settings.get("customer_name", "Customer"))
+        
+        # Excuse generator for follow-ups
+        self.excuse_generator = DynamicExcuseGenerator(
+            self.deepseek,
+            settings.get("player_occupation", "")
+        )
+        
+        # Telegram - Optional
+        self.telegram_enabled = False
+        self.notifier = None
+        self.telegram_user_id = None
+        if settings.get("telegram_user_id") and settings.get("telegram_bot_token"):
+            try:
+                from telegram_notify.notifier import TelegramNotifier
+                self.notifier = TelegramNotifier(settings.get("telegram_bot_token"))
+                self.telegram_user_id = settings.get("telegram_user_id")
+                self.telegram_enabled = True
+            except ImportError:
+                print("[WARNING] telegram_notify not installed. Notifications disabled.")
+        
+        # OpenAI for vision
+        self.openai_enabled = bool(settings.get("openai_api_key"))
+        self.openai_key = settings.get("openai_api_key")
+        
+        # Web
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        
+        # Scraped profiles
+        self.customer_profile: Dict = {}
+        self.player_profile: Dict = {}
+        
+    async def start(self):
+    """Launch and process assignments."""
+    print(f"\n{'='*60}")
+    print(f"ChatHomeBase Bot")
+    print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
+    print(f"{'='*60}\n")
+    
+    self.playwright = await async_playwright().start()
+    
+    # REDUCED SIZE for codegen inspection - change back to 1920,1080 after inspection
+    VIEWPORT_WIDTH = 1280
+    VIEWPORT_HEIGHT = 720
+    
+    self.browser = await self.playwright.chromium.launch(
+        headless=False, 
+        proxy=self.proxy_config,
+        args=[
+            "--force-device-scale-factor=1.0",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-web-security",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-gpu",
+            "--disable-webgl",
+            "--disable-infobars",
+            f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}",
+            # REMOVED: --start-maximized (so window stays at specified size)
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding"
+        ],
+        slow_mo=100
+    )
+    
+    self.context = await self.browser.new_context(
+        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        # REMOVED: screen size (not needed for smaller window)
+        proxy=self.proxy_config,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
+    )
+    
+    self.page = await self.context.new_page()
+    
+    # COMMENTED OUT maximize for now - uncomment after codegen inspection
+    # await self._maximize_window()
+    
+    await self._check_balance()
+    # ... rest of method unchanged
+    
+        """Launch and process assignments."""
+        print(f"\n{'='*60}")
+        print(f"ChatHomeBase Bot")
+        print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
+        print(f"{'='*60}\n")
+        
+        self.playwright = await async_playwright().start()
+        
+        self.browser = await self.playwright.chromium.launch(
+            headless=False, 
+            proxy=self.proxy_config,
+            args=[
+                "--force-device-scale-factor=1.0",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-webgl",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--start-maximized",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
+            ],
+            slow_mo=100
+        )
+        
+        self.context = await self.browser.new_context(
+            viewport={"width": 1920, "height": 1000},
+            screen={"width": 1920, "height": 1080},
+            proxy=self.proxy_config,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
+        )
+        
+        self.page = await self.context.new_page()
+        
+        await self._maximize_window()
+        
+        await self._check_balance()
+        
+        logged_in = False
+        for attempt in range(3):
+            try:
+                logged_in = await self._login()
+                if logged_in:
+                    break
+            except Exception as e:
+                print(f"[WARNING] Login attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    print("[INFO] Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+        
+        if not logged_in:
+            print("[ERROR] Could not log in after 3 attempts")
+            await self.stop()
+            return
+        
+        print("[INFO] Waiting for chat assignments...")
+        print("        (Profiles will be scraped when chat loads)\n")
+        
+        await self._process_assignments()
+    
+    async def _maximize_window(self):
+        """Maximize browser window."""
+        try:
+            screen_size = await self.page.evaluate("""() => {
+                return {
+                    width: window.screen.availWidth,
+                    height: window.screen.availHeight
+                };
+            }""")
+            
+            await self.page.set_viewport_size({
+                "width": screen_size["width"],
+                "height": screen_size["height"] - 40
+            })
+            
+            await self.page.evaluate("""() => {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+            }""")
+            
+            print(f"[INFO] Window maximized to {screen_size['width']}x{screen_size['height']}")
+        except Exception as e:
+            print(f"[WARNING] Could not maximize window: {e}")
+    
+    async def _close_warnings(self):
+        """Close any warning banners/popups."""
+        try:
+            close_selectors = [
+                "button:has-text('CLOSE')",
+                "button:has-text('Close')",
+                "[data-testid='closeButton']",
+                ".close-button",
+                "button.close",
+                "div[role='alert'] button",
+                ".warning-close",
+                "[aria-label='Close']"
+            ]
+            
+            for selector in close_selectors:
+                try:
+                    close_btn = await self.page.query_selector(selector)
+                    if close_btn:
+                        await close_btn.click(timeout=1000)
+                        print("[INFO] Closed warning banner")
+                        await asyncio.sleep(0.5)
+                        break
+                except:
+                    continue
+        except:
+            pass
+    
+    async def _scroll_to_bottom(self):
+        """Scroll chat to bottom."""
+        try:
+            await self._close_warnings()
+            
+            for _ in range(3):
+                await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+                await asyncio.sleep(0.3)
+            
+            chat_selectors = [
+                ".chat-container",
+                ".messages-container", 
+                "[data-testid='chatMessages']",
+                ".message-list",
+                ".chat-messages"
+            ]
+            
+            for selector in chat_selectors:
+                try:
+                    chat_container = await self.page.query_selector(selector)
+                    if chat_container:
+                        await chat_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                        await asyncio.sleep(0.3)
+                except:
+                    continue
+            
+            await self.page.keyboard.press("End")
+            await asyncio.sleep(0.3)
+        except:
+            pass
+    
+    async def _ensure_input_visible(self):
+        """Ensure typing input is visible on screen."""
+        try:
+            await self._close_warnings()
+            
+            input_selectors = [
+                "[data-testid='messageTextArea']",
+                ".chat-input",
+                "textarea",
+                "input[type='text']",
+                "[contenteditable='true']"
+            ]
+            
+            for selector in input_selectors:
+                try:
+                    element = await self.page.query_selector(selector)
+                    if element:
+                        await element.evaluate("el => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+                        await asyncio.sleep(0.5)
+                        return True
+                except:
+                    continue
+            
+            await self._scroll_to_bottom()
+            return False
+        except:
+            return False
+        
+    async def _process_assignments(self):
+        """Process chat assignments."""
+        while True:
+            try:
+                if not await self._wait_for_assignment():
+                    await asyncio.sleep(2)
+                    continue
+                
+                print(f"\n{'='*60}")
+                print(f"New Assignment")
+                print(f"{'='*60}")
+                
+                self.customer_profile = await self._extract_customer_profile()
+                self.player_profile = await self._extract_player_profile()
+                
+                self.excuse_generator = DynamicExcuseGenerator(
+                    self.deepseek,
+                    self.player_profile.get("occupation", self.settings.get("player_occupation", ""))
+                )
+                
+                platform_history = await self._read_platform_history()
+                
+                self.settings["player_name"] = self.player_profile.get("name", "Player")
+                self.settings["player_occupation"] = self.player_profile.get("occupation", "Worker")
+                self.guard.customer_first_name = self.customer_profile.get("name", "Customer").split()[0]
+                
+                print(f"[INFO] Player: {self.player_profile.get('name')}")
+                print(f"[INFO] Customer: {self.customer_profile.get('name')}")
+                
+                if platform_history:
+                    print(f"[INFO] Previous conversation: {len(platform_history)} messages")
+                    await self._extract_facts_from_history(platform_history)
+                
+                await self._process_current_chat()
+                await self._wait_for_chat_close()
+                print("[INFO] Waiting for next assignment...")
+                
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                await asyncio.sleep(5)
+                
+    async def _extract_customer_profile(self) -> Dict:
+        """Scrape customer profile from LEFT sidebar."""
+        profile = {}
+        
+        try:
+            selectors = [
+                "[data-testid='customerProfile']",
+                ".customer-profile",
+                ".left-sidebar",
+                ".chat-sidebar-left"
+            ]
+            
+            profile_text = ""
+            for selector in selectors:
+                try:
+                    profile_text = await self.page.inner_text(selector, timeout=30000)
+                    if profile_text:
+                        break
+                except:
+                    continue
+            
+            patterns = {
+                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
+                "age": r'Age[:\s]+(\d+)',
+                "location": r'Location[:\s]+([^\n]+)',
+                "occupation": r'Occupation[:\s]+([^\n]+)',
+                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
+                "height": r'(\d+ft[\s\din-]+)',
+                "body_type": r'(Slim|Athletic|Curvaceous|Average)',
+                "status": r'(Single|Married|Divorced)',
+            }
+            
+            for field, pattern in patterns.items():
+                match = re.search(pattern, profile_text, re.IGNORECASE)
+                if match:
+                    profile[field] = match.group(1).strip()
+            
+            for section in ["About me", "About you", "Hobbies"]:
+                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
+                if match:
+                    profile[section.lower().replace(" ", "_")] = match.group(1).strip()
+                    
+        except Exception as e:
+            print(f"[WARNING] Customer profile error: {e}")
+            profile["name"] = "Customer"
+        
+        return profile
+        
+    async def _extract_player_profile(self) -> Dict:
+        """Scrape PLAYER profile from RIGHT sidebar."""
+        profile = {}
+        
+        try:
+            selectors = [
+                "[data-testid='playerProfile']",
+                ".player-profile",
+                ".right-sidebar",
+                ".chat-sidebar-right",
+                ".entertainment-profile"
+            ]
+            
+            profile_text = ""
+            for selector in selectors:
+                try:
+                    profile_text = await self.page.inner_text(selector, timeout=2000)
+                    if profile_text:
+                        break
+                except:
+                    continue
+            
+            patterns = {
+                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
+                "age": r'Age[:\s]+(\d+)',
+                "occupation": r'Occupation[:\s]+([^\n]+)',
+                "location": r'Location[:\s]+([^\n]+)',
+                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
+                "hair": r'(Blonde|Brunette|Red|Black|Brown) hair?',
+                "body_type": r'(Slim|Athletic|Curvy|Average)',
+            }
+            
+            for field, pattern in patterns.items():
+                match = re.search(pattern, profile_text, re.IGNORECASE)
+                if match:
+                    profile[field] = match.group(1).strip()
+            
+            for section in ["About me", "Description", "Bio"]:
+                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
+                if match:
+                    profile["about"] = match.group(1).strip()
+            
+            if not profile.get("name"):
+                profile["name"] = self.settings.get("player_name") or "Player"
+            if not profile.get("occupation"):
+                profile["occupation"] = self.settings.get("player_occupation") or "Worker"
+            if not profile.get("location"):
+                profile["location"] = self.settings.get("player_location_cached")
+                
+        except Exception as e:
+            print(f"[WARNING] Player profile error: {e}")
+            profile = {
+                "name": self.settings.get("player_name", "Player"),
+                "occupation": self.settings.get("player_occupation", "Worker"),
+                "location": self.settings.get("player_location_cached")
+            }
+        
+        return profile
+        
+    async def _process_current_chat(self):
+        """Process chat."""
+        await self._close_warnings()
+        
+        conversation = await self._read_conversation_history()
+        print(f"[INFO] History: {len(conversation)} messages")
+        
+        if not conversation:
+            return
+        
+        last_msg = conversation[-1]
+        
+        if last_msg["speaker"] == "customer":
+            print(f"[INFO] Customer: {last_msg['text'][:60]}...")
+            await self._check_for_new_info(last_msg["text"])
+            await self._generate_response(last_msg, conversation, is_follow_up=False)
+            
+        elif last_msg["speaker"] == "player":
+            consecutive_player = 0
+            for msg in reversed(conversation):
+                if msg["speaker"] == "player":
+                    consecutive_player += 1
+                else:
+                    break
+            
+            if consecutive_player >= 2:
+                print("[INFO] Already sent follow-up, waiting...")
+                return
+            
+            print("[INFO] Sending follow-up...")
+            category = self._classify(last_msg["text"]) if last_msg["text"] else "casual"
+            await self._send_follow_up_with_excuse(category)
+        
+    async def _send_follow_up_with_excuse(self, category: str = "casual"):
+        """Send follow-up message."""
+        excuse = self.excuse_generator.generate_excuse(category)
+        
+        if excuse:
+            print(f"[INFO] Generated excuse: {excuse[:80]}...")
+            await self._type_response(excuse)
+            await self._send_response()
+        else:
+            fallbacks = [
+                "Hey, you still there? What are you thinking about?",
+                "Got quiet on me. What's on your mind?",
+                "Still around? Tell me something interesting."
+            ]
+            msg = random.choice(fallbacks)
+            print(f"[INFO] Fallback follow-up: {msg}")
+            await self._type_response(msg)
+            await self._send_response()
+        
+    async def _check_for_new_info(self, customer_msg: str):
+        """Check if customer asks for info."""
+        customer_lower = customer_msg.lower()
+        
+        if any(word in customer_lower for word in ["work", "job", "do for a living", "what do you do", "profession", "career"]):
+            existing_prof = self.logbook.get_player_profession()
+            
+            if existing_prof:
+                detail = self.logbook.get_profession_detail("detail")
+                if not detail:
+                    details = {
+                        "teacher": ["English teacher", "preschool teacher", "high school math teacher"],
+                        "doctor": ["general practitioner", "pediatrician", "nurse practitioner"],
+                        "student": ["part-time barista", "part-time retail", "part-time tutor"],
+                        "unemployed": ["between jobs", "looking for opportunities", "taking time off"]
+                    }
+                    base = existing_prof.lower()
+                    if base in details:
+                        detail = random.choice(details[base])
+                        self.logbook.set_profession(existing_prof, detail, self.customer_profile.get("name"))
+                        print(f"[INFO] Detailed profession: {detail}")
+            else:
+                professions = [
+                    ("teacher", "English teacher"),
+                    ("nurse", "pediatric nurse"),
+                    ("receptionist", "hotel receptionist"),
+                    ("waitress", "diner waitress"),
+                    ("student", "part-time barista")
+                ]
+                base, detail = random.choice(professions)
+                self.logbook.set_profession(base, detail, self.customer_profile.get("name"))
+                self.player_profile["occupation"] = detail
+                print(f"[INFO] Set profession: {detail}")
+        
+        if any(phrase in customer_lower for phrase in ["i am a", "i work as", "my job is", "i'm a"]):
+            patterns = [
+                r'i am a[n]? ([\w\s]+)',
+                r'i work as a[n]? ([\w\s]+)',
+                r'my job is ([\w\s]+)',
+                r'i\'m a[n]? ([\w\s]+)'
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, customer_lower)
+                if match:
+                    client_prof = match.group(1).strip()
+                    self.logbook.add_entry("Client_Work", f"Client profession: {client_prof}", self.customer_profile.get("name"))
+                    print(f"[INFO] Recorded client profession: {client_prof}")
+                    break
+        
+        if any(word in customer_lower for word in ["fantasy", "dream", "like to try", "never tried", "experience"]):
+            if "i've never" in customer_lower or "i want to" in customer_lower:
+                self.logbook.add_entry("Sexual", f"Customer shared: {customer_msg[:100]}", self.customer_profile.get("name"))
+        
+        if any(word in customer_lower for word in ["sick", "surgery", "medical", "health", "migraine", "glasses", "smoke"]):
+            self.logbook.add_entry("Health", f"Customer health info: {customer_msg[:100]}", self.customer_profile.get("name"))
+        
+        if "[Customer shared a photo:" in customer_msg:
+            photo_desc = customer_msg.split("[Customer shared a photo:")[1].split("]")[0]
+            self.logbook.add_entry("Update", f"Photo received: {photo_desc}", self.customer_profile.get("name"))
+            
+    async def _generate_response(self, last_msg: Dict, conversation: List[Dict], is_follow_up: bool = False):
+        """Generate response."""
+        recent = conversation[-15:]
+        category = self._classify(last_msg["text"]) if not is_follow_up else "casual"
+        
+        if is_follow_up:
+            print("[INFO] Generating follow-up message...")
+        
+        system_prompt = build_system_prompt(
+            rules=self.rules,
+            player_name=self.player_profile.get("name", "Player"),
+            player_occupation=self.player_profile.get("occupation", "Worker"),
+            player_location=self.player_profile.get("location"),
+            customer_name=self.customer_profile.get("name", "Customer"),
+            customer_location=self.customer_profile.get("location", "Unknown"),
+            logbook_summary=self._build_summary(),
+            category=category,
+            past_replies=[m["text"] for m in recent if m["speaker"] == "player"][-10:],
+            user_message=last_msg["text"],
+            is_follow_up=is_follow_up
+        )
+        
+        history = [{"role": "user" if m["speaker"] == "customer" else "assistant", "content": m["text"]} 
+                   for m in recent]
+        
+        result = self.deepseek.generate(system_prompt, history, user_message=last_msg["text"], temperature=0.95)
+        
+        if result["ok"]:
+            reply = result["text"]
+            print(f"[INFO] Bot: {reply[:80]}...")
+            await self._type_response(reply)
+            await self._send_response()
+        else:
+            print(f"[ERROR] {result['error']}")
+
+    async def _read_platform_history(self) -> List[Dict]:
+        """Read previous conversation history."""
+        messages = []
+        
+        try:
+            all_bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
+            
+            for bubble in all_bubbles:
+                try:
+                    classes = await bubble.get_attribute("class") or ""
+                    
+                    is_old = any(marker in classes for marker in ["old", "previous", "history", "past", "read-only", "archived"])
+                    
+                    if not is_old:
+                        continue
+                    
+                    text_elem = await bubble.query_selector(".message-content, .text")
+                    text = await text_elem.inner_text() if text_elem else ""
+                    
+                    if "customer" in classes or "client" in classes:
+                        speaker = "customer"
+                    elif "entertainment" in classes or "player" in classes or "operator" in classes:
+                        speaker = "player"
+                    else:
+                        continue
+                    
+                    if text.strip():
+                        messages.append({
+                            "speaker": speaker,
+                            "text": text.strip(),
+                            "is_historical": True
+                        })
+                        
+                except:
+                    continue
+                    
+        except Exception as e:
+            print(f"[WARNING] Failed to read platform history: {e}")
+        
+        if messages:
+            print(f"[INFO] Loaded {len(messages)} messages from platform history")
+            
+        return messages
+    
+    async def _extract_facts_from_history(self, history: List[Dict]):
+        """Scan previous conversation for facts."""
+        player_messages = [m["text"] for m in history if m["speaker"] == "player"]
+        
+        for msg in player_messages:
+            msg_lower = msg.lower()
+            
+            if any(phrase in msg_lower for phrase in ["i am a", "i'm a", "i work as", "my job is"]):
+                patterns = [
+                    r'i am a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'i\'m a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'i work as a[n]? ([\w\s]+?)(?:\.|$)',
+                    r'my job is ([\w\s]+?)(?:\.|$)'
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, msg_lower)
+                    if match:
+                        job = match.group(1).strip()
+                        if not self.logbook.get_player_profession():
+                            self.logbook.set_profession(job, client=self.customer_profile.get("name"))
+                            print(f"[INFO] Extracted profession from history: {job}")
+                        break
+            
+            if "i live in" in msg_lower or "i'm from" in msg_lower or "i am from" in msg_lower:
+                patterns = [
+                    r'i live in ([\w\s,]+?)(?:\.|$)',
+                    r'i\'m from ([\w\s,]+?)(?:\.|$)',
+                    r'i am from ([\w\s,]+?)(?:\.|$)'
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, msg_lower)
+                    if match:
+                        loc = match.group(1).strip()
+                        self.logbook.add_entry("Work", f"Location mentioned: {loc}", self.customer_profile.get("name"))
+                        print(f"[INFO] Extracted location from history: {loc}")
+                        break
+
+    def _build_summary(self) -> str:
+        """Build summary from profiles + logbook."""
+        parts = []
+        
+        if self.player_profile.get("age"):
+            parts.append(f"Player Age: {self.player_profile['age']}")
+        if self.player_profile.get("occupation"):
+            parts.append(f"Player Work: {self.player_profile['occupation']}")
+        if self.player_profile.get("location"):
+            parts.append(f"Player Location: {self.player_profile['location']}")
+        if self.player_profile.get("about"):
+            parts.append(f"Player Bio: {self.player_profile['about'][:100]}")
+        
+        if self.customer_profile.get("age"):
+            parts.append(f"Customer Age: {self.customer_profile['age']}")
+        if self.customer_profile.get("about_me"):
+            parts.append(f"Customer: {self.customer_profile['about_me'][:80]}")
+        
+        entries = self.logbook.all_entries()[-5:]
+        for e in entries:
+            parts.append(f"[{e['category']}] {e['comment'][:60]}")
+        
+        return "\n".join(parts) if parts else "(No profile data)"
+        
+    async def _read_conversation_history(self) -> List[Dict]:
+        """Read all messages including image detection."""
+        messages = []
+        bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
+        
+        for bubble in bubbles:
+            try:
+                classes = await bubble.get_attribute("class") or ""
+                
+                if "message-customer" in classes or "customer" in classes:
+                    speaker = "customer"
+                elif "message-entertainment" in classes or "entertainment" in classes:
+                    speaker = "player"
+                else:
+                    continue
+                
+                text_elem = await bubble.query_selector(".message-content, .text")
+                text = await text_elem.inner_text() if text_elem else ""
+                
+                image_elem = await bubble.query_selector("img, .message-image, [data-testid='messageImage']")
+                if image_elem and speaker == "customer":
+                    image_url = await image_elem.get_attribute("src")
+                    if image_url:
+                        print(f"[INFO] Customer sent image")
+                        image_desc = await self._analyze_image(image_url)
+                        text += f" [Customer shared a photo: {image_desc}]"
+                
+                if text.strip():
+                    messages.append({"speaker": speaker, "text": text.strip()})
+                    
+            except Exception as e:
+                continue
+        
+        return messages
+    
+    async def _analyze_image(self, image_url: str) -> str:
+        """Analyze image using OpenAI Vision if enabled."""
+        if not self.openai_enabled:
+            return "photo"
+        
+        try:
+            js_code = """
+                async () => {
+                    const res = await fetch("%s");
+                    const blob = await res.blob();
+                    return new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+                }
+            """ % image_url
+            
+            response = await self.page.evaluate(js_code)
+            
+            if response and ',' in response:
+                base64_data = response.split(',')[1]
+                
+                import openai
+                client = openai.AsyncOpenAI(api_key=self.openai_key)
+                
+                result = await client.chat.completions.create(
+                    model="gpt-4-vision-preview",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image briefly and compliment what you see. If it's a person/selfie/nude, be flattering and appreciative. Keep it under 20 words."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_data}"}}
+                        ]
+                    }],
+                    max_tokens=60
+                )
+                
+                desc = result.choices[0].message.content
+                print(f"[INFO] Image analysis: {desc[:60]}...")
+                return desc
+                
+        except Exception as e:
+            print(f"[WARNING] Image analysis failed: {e}")
+        
+        return "photo"
+    
+    async def _type_response(self, text: str):
+        """Type like a human - slower, irregular, to avoid copy-paste detection."""
+        # Ensure input is visible first (NEW - fixes view issue)
+        await self._ensure_input_visible()
+        
+        # Find input box
+        input_selectors = [
+            "[data-testid='messageTextArea']",
+            ".chat-input",
+            "textarea",
+            "[contenteditable='true']"
+        ]
+        
+        input_box = None
+        for selector in input_selectors:
+            try:
+                input_box = await self.page.query_selector(selector)
+                if input_box:
+                    await input_box.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.5)
+                    await input_box.click()
+                    break
+            except:
+                continue
+        
+        if not input_box:
+            print("[ERROR] Could not find input box")
+            return
+        
+        # Clear existing text naturally
+        await self.page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await self.page.keyboard.press("Delete")
+        await asyncio.sleep(0.3)
+        
+        # TYPE LIKE A HUMAN (fixes copy-paste warning)
+        print(f"[INFO] Typing {len(text)} characters...")
+        
+        words = text.split()
+        for i, word in enumerate(words):
+            # Type each character with human delay (80-250ms)
+            for char in word:
+                delay = random.uniform(80, 250)
+                await self.page.keyboard.type(char, delay=delay)
+                
+                # Occasional longer pause (thinking)
+                if random.random() < 0.05:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+            
+            # Space between words
+            if i < len(words) - 1:
+                await self.page.keyboard.type(" ", delay=random.uniform(50, 150))
+                
+                # Occasional pause between words
+                if random.random() < 0.1:
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+        
+        print("[INFO] Finished typing")
+        
+    async def _send_response(self):
+        if self.dry_run:
+            print("[DRY RUN] Review and press Enter...")
+            input()
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Delete")
+            return
+        
+        # Try multiple send button selectors
+        send_selectors = [
+            "[data-testid='sendChatMessageButton']",
+            ".send-button",
+            "button[type='submit']",
+            "button:has-text('Send')",
+            "button.send"
+        ]
+        
+        sent = False
+        for selector in send_selectors:
+            try:
+                await self.page.click(selector, timeout=2000)
+                sent = True
+                print("[INFO] Sent")
+                break
+            except:
+                continue
+        
+        if not sent:
+            # Fallback: press Enter key
+            await self.page.keyboard.press("Enter")
+            print("[INFO] Sent (using Enter key)")
+        
+        # Scroll after sending
+        await self._scroll_to_bottom()
+        
+    def _classify(self, text: str) -> str:
+        t = text.lower()
+        if any(k in t for k in ["sex", "fuck", "cock", "pussy"]):
+            return "sexual"
+        if any(k in t for k in ["sexy", "beautiful", "kiss"]):
+            return "flirty"
+        return "casual"
+        
+    async def _wait_for_assignment(self) -> bool:
+        try:
+            await self.page.wait_for_selector(".message-blob, .chat-message", timeout=10000)
+            await self._scroll_to_bottom()
+            return True
+        except:
+            return False
+            
+    async def _wait_for_chat_close(self):
+        for _ in range(60):
+            chat = await self.page.query_selector(".message-blob")
+            if not chat:
+                return True
+            await asyncio.sleep(1)
+        return True
+        
+    async def _check_balance(self):
+        balance = self.deepseek.check_balance()
+        print(f"[INFO] DeepSeek balance: ${balance:.2f}")
+        
+        if balance < 4.0 and self.telegram_enabled and self.notifier:
+            try:
+                self.notifier.notify_low_balance(self.telegram_user_id, balance, 4.0)
+            except Exception as e:
+                print(f"[WARNING] Failed to send Telegram: {e}")
+        
+    async def _login(self):
+        """Login to chathomebase."""
+        print("[INFO] Logging in...")
+        
+        try:
+            await self.page.goto("https://chathomebase.com/login")
+            
+            await self.page.fill("input[name='email']", self.settings["chathomebase_login"])
+            await self.page.fill("input[name='password']", self.settings["chathomebase_password"])
+            
+            await self.page.click("[data-testid='signInButton']")
+            
+            await self.page.wait_for_url("**/chat/lobby", timeout=30000)
+            
+            print("[INFO] Successfully logged in")
+            
+        except Exception as e:
+            current_url = self.page.url
+            print(f"[ERROR] Login failed. Current URL: {current_url}")
+            print(f"[ERROR] Timeout waiting for /chat/lobby: {e}")
+            raise
+        
+        for _ in range(5):
+            try:
+                await self.page.click("[data-testid='announcementsDialogNextButton']", timeout=2000)
+                await asyncio.sleep(0.5)
+            except:
+                break
+        try:
+            await self.page.click("[data-testid='announcementsDialogContinueButton']", timeout=2000)
+        except:
+            pass
+            
+        print("[INFO] Ready for assignments")
+        return True
+        
+    async def stop(self):
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+
+async def run_web_bot(settings: dict, dry_run: bool = False):
+    adapter = ChatHomeBaseAdapter(settings, dry_run=dry_run)
+    try:
+        await adapter.start()
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopped")
+    finally:
+        await adapter.stop()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\bootstrap\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\bootstrap\first_run_wizard.py ===
+"""First-run setup wizard for LIVE web platform."""
+
+from pathlib import Path
+from rich.console import Console
+from rich.prompt import Prompt, Confirm
+from rich.panel import Panel
+from rich.rule import Rule
+
+console = Console()
+
+
+def run_wizard(config_file: Path):
+    """Run setup wizard for live web platform."""
+    console.print(Panel.fit(
+        "[bold cyan]ChatHomeBase Bot Setup[/bold cyan]\n"
+        "Live Platform Version - Profiles auto-scraped from website",
+        title="Welcome",
+        border_style="cyan"
+    ))
+    
+    # Check if updating existing
+    existing = {}
+    if config_file.exists():
+        from config.settings import load_settings
+        existing = load_settings(config_file)
+        console.print("[yellow]Updating existing configuration...[/yellow]\n")
+    
+    console.rule("[bold]Your DeepSeek API Key[/bold]")
+    console.print("Each user needs their own DeepSeek API key.")
+    console.print("Get yours from: [cyan]platform.deepseek.com[/cyan]")
+    deepseek_key = Prompt.ask("DeepSeek API key", 
+                               default=existing.get("deepseek_api_key", "")).strip()
+    
+    console.rule("[bold]ChatHomeBase Credentials[/bold]")
+    chb_email = Prompt.ask("ChatHomeBase email", 
+                          default=existing.get("chathomebase_login", "")).strip()
+    chb_password = Prompt.ask("ChatHomeBase password", 
+                               password=True).strip()
+    
+   # Optional: Proxy
+    console.rule("[bold]Proxy (Optional)[/bold]")
+    use_proxy = Confirm.ask("Use proxy?", default=False)
+    proxy = None
+    if use_proxy:
+        console.print("Formats accepted:")
+        console.print("  - URL: http://user:pass@host:port")
+        console.print("  - IP format: 1.2.3.4:8080:user:pass")
+        proxy_input = Prompt.ask("Proxy server").strip()
+        
+        if proxy_input:
+            # Check if it's IP:Port:User:Pass format
+            if proxy_input.count(":") >= 3 and not proxy_input.startswith("http"):
+                # Convert 1.2.3.4:8080:user:pass to http://user:pass@1.2.3.4:8080
+                parts = proxy_input.split(":")
+                if len(parts) >= 4:
+                    ip = parts[0]
+                    port = parts[1]
+                    username = parts[2]
+                    password = ":".join(parts[3:])  # Password might contain colons
+                    proxy_url = f"http://{username}:{password}@{ip}:{port}"
+                    proxy = {"server": proxy_url}
+                    console.print(f"[green]Converted to: {proxy_url}[/green]")
+            else:
+                # Already in URL format
+                proxy = {"server": proxy_input}
+    
+    # Optional: Telegram notifications
+    console.rule("[bold]Telegram Notifications (Optional)[/bold]")
+    use_telegram = Confirm.ask("Enable Telegram low-balance alerts?", default=False)
+    
+    telegram_token = None
+    telegram_user_id = None
+    
+    if use_telegram:
+        console.print("Get your bot token from @BotFather")
+        telegram_token = Prompt.ask("Telegram bot token").strip()
+        console.print("Get your user ID from @userinfobot")
+        telegram_user_id = Prompt.ask("Telegram user ID").strip()
+    
+    # Optional: OpenAI for vision
+    console.rule("[bold]Image Analysis (Optional)[/bold]")
+    use_vision = Confirm.ask("Enable image analysis? (Requires OpenAI API key)", default=False)
+    
+    openai_key = None
+    if use_vision:
+        console.print("Get your key from: [cyan]platform.openai.com[/cyan]")
+        openai_key = Prompt.ask("OpenAI API key").strip()
+    
+    # Build settings
+    settings = {
+        **existing,
+        "deepseek_api_key": deepseek_key,
+        "chathomebase_login": chb_email,
+        "chathomebase_password": chb_password,
+        "proxy": proxy,
+        "telegram_bot_token": telegram_token,
+        "telegram_user_id": telegram_user_id,
+        "openai_api_key": openai_key,
+        "deepseek_low_balance_threshold_usd": 4.0,
+    }
+    
+    # Save
+    from config.settings import save_settings
+    save_settings(config_file, settings)
+    
+    console.print("\n[green]✓ Setup complete![/green]")
+    console.print("[cyan]Player and customer profiles will be auto-scraped from chathomebase.com[/cyan]")
+    if proxy:
+        console.print(f"[yellow]Proxy configured: {proxy['server']}[/yellow]")
+    console.print("Run [bold]LAUNCH.bat[/bold] to start the bot.\n")
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from pathlib import Path
+    run_wizard(Path("config/settings.json"))
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\config\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\config\settings.py ===
+"""Settings management."""
+
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_settings(config_file: Path) -> dict:
+    """Load settings with shared Google key."""
+    settings = _load_json(config_file) if config_file.exists() else {}
+    
+    # Load shared Google key from separate file
+    google_key_file = config_file.parent / "google_key.txt"
+    if google_key_file.exists():
+        settings["google_api_key"] = google_key_file.read_text().strip()
+    
+    return settings
+
+
+def save_settings(config_file: Path, settings: dict) -> None:
+    """Save settings (without Google key - that's in separate file)."""
+    settings_to_save = {k: v for k, v in settings.items() if k != "google_api_key"}
+    _save_json(config_file, settings_to_save)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\__init__.py ===
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\deepseek_client.py ===
+"""DeepSeek API client with guard integration."""
+
+import requests
+import json
+from typing import Dict, List, Optional
+
+
+class DeepSeekClient:
+    """Client for DeepSeek API with retry logic."""
+    
+    def __init__(self, api_key: str, guard=None, low_balance_threshold_usd: float = 4.0, max_retries: int = 3):
+        self.api_key = api_key
+        self.guard = guard
+        self.low_balance_threshold = low_balance_threshold_usd
+        self.max_retries = max_retries
+        self.base_url = "https://api.deepseek.com/v1"
+        self._balance_cache = None
+        self._balance_time = 0
+        
+    def check_balance(self) -> float:
+        """Check DeepSeek account balance."""
+        import time
+        if time.time() - self._balance_time < 60 and self._balance_cache is not None:
+            return self._balance_cache
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}/user/balance",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # DeepSeek returns balance in balance_infos array
+                if "balance_infos" in data and len(data["balance_infos"]) > 0:
+                    balance_info = data["balance_infos"][0]
+                    balance = float(balance_info.get("total_balance", 0))
+                    self._balance_cache = balance
+                    self._balance_time = time.time()
+                    return balance
+                else:
+                    print(f"[WARNING] Unexpected balance format")
+                    return 0.0
+            else:
+                print(f"[ERROR] Balance check failed: {response.status_code}")
+                
+        except Exception as e:
+            print(f"[ERROR] Balance check exception: {e}")
+        
+        return self._balance_cache or 0.0
+        
+    def generate(self, system_prompt: str, history: List[Dict], user_message: str, temperature: float = 0.95) -> Dict:
+        """Generate response with retries and guard checking."""
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": 150
+                    },
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data["choices"][0]["message"]["content"].strip()
+                    
+                    # Apply guard if available
+                    if self.guard:
+                        text = self.guard.filter(text)
+                    
+                    return {"ok": True, "text": text}
+                    
+                elif response.status_code == 429:
+                    import time
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return {"ok": False, "error": f"API error {response.status_code}: {response.text}"}
+                    
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return {"ok": False, "error": str(e)}
+                import time
+                time.sleep(1)
+        
+        return {"ok": False, "error": "Max retries exceeded"}
+
+        
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\excuse_bank.py ===
+"""Dynamic excuse generator using DeepSeek AI — aligned with player persona."""
+
+import random
+from typing import List, Optional
+
+
+class DynamicExcuseGenerator:
+    """Generates unique, persona-aligned excuses on-demand."""
+    
+    PERSONA_SCENARIOS = {
+        "store attendant": [
+            "restocking shelves", "helping a difficult customer", "counting inventory",
+            "cleaning up a spill", "unlocking the storage room", "organizing the back room",
+            "price-checking an item", "assisting with returns", "restocking the cooler",
+            "dealing with a broken scanner", "helping find a product", "cleaning the aisles",
+            "restocking register tape", "organizing the display", "checking expiration dates"
+        ],
+        "teacher": [
+            "grading papers", "preparing lesson plans", "talking to a parent",
+            "helping a student after class", "organizing classroom supplies", "filling out reports",
+            "setting up a projector", "finding lost homework", "calming down a student"
+        ],
+        "nurse": [
+            "checking on a patient", "filling out charts", "restocking medical supplies",
+            "talking to a doctor", "calming a family member", "organizing the supply closet"
+        ],
+        "waitress": [
+            "taking a large order", "cleaning up a table", "helping in the kitchen",
+            "restocking napkins", "dealing with a difficult customer", "balancing the register"
+        ],
+        "receptionist": [
+            "answering phones", "scheduling appointments", "organizing files",
+            "greeting a client", "fixing the printer", "restocking office supplies"
+        ],
+        "barista": [
+            "making a complicated order", "restocking coffee beans", "cleaning the espresso machine",
+            "wiping down the counter", "organizing the pastry display", "grinding fresh beans"
+        ],
+        "bartender": [
+            "mixing a complicated drink", "restocking the liquor shelf", "cleaning glasses",
+            "wiping down the bar", "checking IDs", "organizing the cooler"
+        ],
+        "hair stylist": [
+            "mixing hair color", "cleaning up cut hair", "organizing styling products",
+            "washing towels", "setting up a station", "finding the right tool"
+        ],
+        "fitness instructor": [
+            "setting up equipment", "wiping down machines", "organizing the weight room",
+            "finding the right music", "cleaning yoga mats", "restocking water bottles"
+        ],
+        "default": [
+            "organizing my workspace", "dealing with a technical issue", "restocking supplies",
+            "cleaning up a mess", "finding something I misplaced", "helping a colleague"
+        ]
+    }
+    
+    def __init__(self, deepseek_client, player_occupation: str = ""):
+        self.deepseek = deepseek_client
+        self.player_occupation = player_occupation.lower()
+        self.used_excuses: List[str] = []
+        self.used_phrases: set = set()
+        self.scenarios = self._get_scenarios()
+        
+    def _get_scenarios(self) -> List[str]:
+        for occupation, scenarios in self.PERSONA_SCENARIOS.items():
+            if occupation in self.player_occupation:
+                return scenarios
+        return self.PERSONA_SCENARIOS["default"]
+    
+    def generate_excuse(self, category: str, used: List[str] = None) -> Optional[str]:
+        if used:
+            self.used_excuses.extend(used)
+        
+        scenario = random.choice(self.scenarios)
+        
+        tone_instructions = {
+            "casual": f"warm and friendly. Mention: {scenario}",
+            "flirty": f"playful and teasing with light innuendo. Mention being distracted by: {scenario}",
+            "sexual": f"explicit and erotic. Connect {scenario} to sexual thoughts"
+        }
+        
+        tone = tone_instructions.get(category, tone_instructions["casual"])
+        
+        used_summary = ""
+        if self.used_excuses:
+            recent = self.used_excuses[-5:]
+            used_summary = "AVOID these scenarios:\n" + "\n".join(f"- {e[:60]}..." for e in recent)
+        
+        prompt = f"""You are a {self.player_occupation}. Write a short excuse (160-260 characters) explaining why you were delayed.
+
+SCENARIO: {scenario}
+TONE: {tone}
+
+REQUIREMENTS:
+- Sound natural for a {self.player_occupation}
+- Reference the scenario authentically
+- End with open-ended question
+- NO em dashes, NO exclamation marks, NO filler sounds
+- COMPLETELY different from previous excuses
+
+{used_summary}
+
+Write ONE excuse:"""
+        
+        result = self.deepseek.generate(
+            system_prompt=prompt,
+            history=[{"role": "user", "content": "Generate excuse"}],
+            user_message="",
+            temperature=0.7
+        )
+        
+        if result["ok"]:
+            excuse = result["text"].strip()
+            if 150 <= len(excuse) <= 300 and self._is_unique_enough(excuse):
+                self.used_excuses.append(excuse)
+                self._extract_phrases(excuse)
+                return excuse
+        
+        return self._fallback_excuse(category, scenario)
+    
+    def _is_unique_enough(self, excuse: str) -> bool:
+        excuse_lower = excuse.lower()
+        if excuse_lower in [e.lower() for e in self.used_excuses]:
+            return False
+        
+        words = excuse_lower.split()
+        for i in range(len(words) - 2):
+            phrase = " ".join(words[i:i+3])
+            if phrase in self.used_phrases:
+                return False
+        return True
+    
+    def _extract_phrases(self, text: str):
+        words = text.lower().split()
+        for i in range(len(words) - 2):
+            phrase = " ".join(words[i:i+3])
+            self.used_phrases.add(phrase)
+    
+    def _fallback_excuse(self, category: str, scenario: str) -> str:
+        templates = {
+            "store attendant": {
+                "casual": [
+                    f"Got caught up {scenario} and lost track of time. What have you been up to?",
+                    f"Had to stop and deal with {scenario}. What's something that interrupted your day recently?",
+                    f"Got distracted by {scenario}. When's the last time you got completely sidetracked?"
+                ],
+                "flirty": [
+                    f"Was {scenario} and kept imagining you watching me. What do you picture me doing right now?",
+                    f"Got distracted {scenario} and started thinking about your hands on me. Where would you touch me first?"
+                ],
+                "sexual": [
+                    f"Was {scenario} and started touching myself thinking about you. How hard are you right now?",
+                    f"Got distracted {scenario} and my panties got soaked imagining you. What would you do if you saw?"
+                ]
+            }
+        }
+        
+        occupation_key = None
+        for occ in self.PERSONA_SCENARIOS.keys():
+            if occ in self.player_occupation:
+                occupation_key = occ
+                break
+        
+        if occupation_key and occupation_key in templates:
+            options = templates[occupation_key].get(category, templates[occupation_key]["casual"])
+        else:
+            options = {
+                "casual": [f"Got caught up with {scenario}. What have you been up to?"],
+                "flirty": [f"Was {scenario} and started thinking about you. What do you picture me doing?"],
+                "sexual": [f"Was {scenario} and started touching myself thinking about you. How hard are you?"]
+            }.get(category, [f"Got caught up with {scenario}. What have you been up to?"])
+        
+        for option in options:
+            if option.lower() not in [e.lower() for e in self.used_excuses]:
+                self.used_excuses.append(option)
+                return option
+        
+        base = random.choice(options)
+        modifiers = [" just now", " a few minutes ago", " earlier"]
+        return base + random.choice(modifiers)
+    
+    def clear_history(self):
+        self.used_excuses = []
+        self.used_phrases = set()
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\google_geo.py ===
+"""Google Geocoding API client."""
+
+import requests
+from typing import Optional
+
+
+class LocationFinder:
+    """Find location using Google Geocoding API."""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://maps.googleapis.com/maps/api/geocode/json"
+    
+    def get_city_from_location(self, location: str) -> Optional[str]:
+        """Extract city from location string."""
+        try:
+            response = requests.get(
+                self.base_url,
+                params={
+                    "address": location,
+                    "key": self.api_key
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("results"):
+                    # Extract city from address components
+                    for component in data["results"][0]["address_components"]:
+                        if "locality" in component.get("types", []):
+                            return component["long_name"]
+                        if "administrative_area_level_2" in component.get("types", []):
+                            return component["long_name"]
+                    
+                    # Fallback to formatted address
+                    return data["results"][0]["formatted_address"].split(",")[0]
+                    
+        except Exception as e:
+            print(f"[WARNING] Geocoding failed: {e}")
+        
+        return None
+    
+    def get_nearby_city(self, location: str, max_distance_miles: int = 50) -> Optional[str]:
+        """Find a city near the given location."""
+        # Simplified - just return the city for now
+        return self.get_city_from_location(location)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\logbook.py ===
+"""Logbook for tracking invented details with categories."""
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
+
+
+class Logbook:
+    """Tracks invented personal details for consistency across customers."""
+    
+    CATEGORIES = [
+        "Work",           # Player's profession details
+        "Sexual",         # Fantasies, preferences, experiences  
+        "Health",         # Health issues, conditions
+        "Update",         # Appointments, events, photos received
+        "Client_Work",    # Customer's profession
+        "Other"           # Anything else
+    ]
+    
+    def __init__(self, log_dir: Path, customer_name: str):
+        self.log_dir = log_dir
+        self.customer_name = customer_name
+        self.log_file = log_dir / f"{customer_name}_{datetime.now().strftime('%Y%m%d')}.json"
+        self.entries: List[Dict] = []
+        self.player_facts: Dict[str, str] = {}  # Global player facts across all customers
+        self._load()
+        self._load_global_facts()
+    
+    def _load(self):
+        """Load existing logbook for this customer."""
+        try:
+            if self.log_file.exists():
+                with open(self.log_file, 'r') as f:
+                    self.entries = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load logbook: {e}")
+            self.entries = []
+    
+    def _load_global_facts(self):
+        """Load global player facts across all customers."""
+        global_file = self.log_dir / "player_facts.json"
+        try:
+            if global_file.exists():
+                with open(global_file, 'r') as f:
+                    self.player_facts = json.load(f)
+        except:
+            self.player_facts = {}
+    
+    def _save_global_facts(self):
+        """Save global player facts."""
+        global_file = self.log_dir / "player_facts.json"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with open(global_file, 'w') as f:
+                json.dump(self.player_facts, f, indent=2)
+        except Exception as e:
+            print(f"[WARNING] Failed to save global facts: {e}")
+    
+    def add_entry(self, category: str, comment: str, client: str = None):
+        """Add entry to logbook."""
+        if category not in self.CATEGORIES:
+            category = "Other"
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "category": category,
+            "comment": comment,
+            "client": client or self.customer_name
+        }
+        self.entries.append(entry)
+        self._save()
+        
+        # If it's a player work fact, save globally
+        if category == "Work" and ":" in comment:
+            key = comment.split(":")[0].strip().lower()
+            value = comment.split(":", 1)[1].strip() if ":" in comment else comment
+            self.player_facts[key] = value
+            self._save_global_facts()
+    
+    def get_player_profession(self) -> Optional[str]:
+        """Get player's established profession."""
+        return self.player_facts.get("profession")
+    
+    def get_profession_detail(self, detail_type: str) -> Optional[str]:
+        """Get specific profession detail."""
+        return self.player_facts.get(f"profession_{detail_type}")
+    
+    def set_profession(self, base: str, detail: str = None, client: str = None):
+        """Set player's profession."""
+        self.player_facts["profession"] = base
+        if detail:
+            self.player_facts["profession_detail"] = detail
+        
+        comment = f"Profession: {base}"
+        if detail:
+            comment += f" - {detail}"
+        
+        self.add_entry("Work", comment, client)
+        self._save_global_facts()
+    
+    def get_facts_by_category(self, category: str) -> List[Dict]:
+        """Get all entries for a category."""
+        return [e for e in self.entries if e["category"] == category]
+    
+    def get_summary_for_prompt(self) -> str:
+        """Build summary for AI prompt."""
+        lines = []
+        
+        # Work/Profession
+        prof = self.get_player_profession()
+        if prof:
+            detail = self.get_profession_detail("detail")
+            lines.append(f"Work: {prof}" + (f" ({detail})" if detail else ""))
+        
+        # Recent entries by category
+        for cat in ["Sexual", "Health", "Update"]:
+            entries = self.get_facts_by_category(cat)[-3:]
+            for e in entries:
+                lines.append(f"{cat}: {e['comment'][:80]}")
+        
+        return "\n".join(lines) if lines else "No established facts yet."
+    
+    def _save(self):
+        """Save logbook."""
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.log_file, 'w') as f:
+                json.dump(self.entries, f, indent=2)
+        except Exception as e:
+            print(f"[WARNING] Failed to save logbook: {e}")
+    
+    def all_entries(self) -> List[Dict]:
+        """Get all entries."""
+        return self.entries
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\prompt_builder.py ===
+"""Build system prompts for DeepSeek."""
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+def load_rules(rules_file: Path) -> Dict:
+    """Load rules from JSON file."""
+    try:
+        with open(rules_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARNING] Failed to load rules: {e}")
+        return {}
+
+
+def build_system_prompt(
+    rules: Dict,
+    player_name: str,
+    player_occupation: str,
+    player_location: Optional[str],
+    customer_name: str,
+    customer_location: str,
+    logbook_summary: str,
+    category: str,
+    past_replies: List[str],
+    user_message: str,
+    is_follow_up: bool = False
+) -> str:
+    """Build system prompt for DeepSeek."""
+    
+    follow_up_instruction = ""
+    if is_follow_up:
+        follow_up_instruction = "\nThe customer hasn't replied. Send a short, flirty follow-up (10-15 words) to re-engage them."
+    
+    # Profession consistency warning
+    profession_warning = ""
+    if player_occupation and player_occupation != "Worker":
+        profession_warning = f"\nIMPORTANT: You are a {player_occupation}. Never claim a different profession. You can elaborate but cannot change it."
+    
+    prompt = f"""You are {player_name}, a {player_occupation} from {player_location or 'a small town'}.
+
+STRICT RULES:
+- Minimum 150 characters per response
+- Maximum 500 characters per response{profession_warning}
+- Never share phone, email, or social media
+- Never suggest meeting in person
+- Always ask a question to keep conversation going
+
+Your established facts (NEVER contradict these):
+{logbook_summary}
+
+You are chatting with {customer_name} from {customer_location}.
+Customer just said: "{user_message}"
+
+{follow_up_instruction}
+
+Respond naturally as {player_name}. Be engaging, flirty, and make them want to reply."""
+
+    return prompt
+
+
+def build_history_messages(conversation: List[Dict]) -> List[Dict]:
+    """Convert conversation to DeepSeek format."""
+    return [
+        {"role": "user" if m["speaker"] == "customer" else "assistant", "content": m["text"]}
+        for m in conversation
+    ]
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\rule_guard.py ===
+"""Post-generation rule guard."""
+
+import json
+import re
+from pathlib import Path
+from typing import List, Optional
+
+
+class RuleGuard:
+    """Filters and guards bot responses."""
+    
+    def __init__(self, rules_file: Path, banned_file: Path, customer_first_name: str = "Customer"):
+        self.rules_file = rules_file
+        self.banned_file = banned_file
+        self.customer_first_name = customer_first_name
+        self.banned_phrases: List[str] = []
+        self.replacement_map: Dict[str, str] = {}
+        
+        self._load_banned()
+        
+    def _load_banned(self):
+        """Load banned phrases."""
+        try:
+            if self.banned_file.exists():
+                with open(self.banned_file, 'r') as f:
+                    self.banned_phrases = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load banned phrases: {e}")
+            self.banned_phrases = []
+    
+    def set_customer_name(self, name: str):
+        """Update customer first name."""
+        self.customer_first_name = name.split()[0] if name else "Customer"
+    
+    def filter(self, text: str) -> str:
+        """Filter response text."""
+        # Check banned phrases
+        for phrase in self.banned_phrases:
+            if phrase.lower() in text.lower():
+                print(f"[GUARD] Banned phrase detected: {phrase}")
+                text = text.replace(phrase, "[removed]")
+        
+        # Ensure customer name is correct
+        # (This would be customized based on your rules)
+        
+        return text.strip()
+    
+    def check_response(self, text: str, customer_msg: str) -> tuple[bool, Optional[str]]:
+        """Check if response violates rules."""
+        # Check for banned content
+        for phrase in self.banned_phrases:
+            if phrase.lower() in text.lower():
+                return False, f"Contains banned phrase: {phrase}"
+        
+        return True, None
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\core\timer_calculator.py ===
+"""Timer utilities for response timing."""
+
+import random
+
+
+class TimerCalculator:
+    """Calculate appropriate response delays."""
+    
+    def __init__(self):
+        self.base_typing_speed = 0.05  # seconds per character
+    
+    def calculate_typing_delay(self, text_length: int) -> float:
+        """Calculate realistic typing time."""
+        return text_length * self.base_typing_speed + random.uniform(0.5, 1.5)
+    
+    def get_response_delay(self) -> float:
+        """Get random delay before responding."""
+        return random.uniform(1.0, 3.0)
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\data\banned_phrases.json ===
+[
+  "phone number",
+  "email me",
+  "text me",
+  "outside this platform",
+  "real name",
+  "actual location",
+  "meet up",
+  "in person",
+  "facebook",
+  "instagram",
+  "snapchat",
+  "whatsapp",
+  "telegram",
+  "kik",
+  "skype",
+  "discord"
+]
+
+
+
+=== FILE: C:\Users\user\Desktop\ChatHomeBase-Distribution\Account-Template\data\rules.json ===
+{
+  "profession_rules": {
+    "single_profession": true,
+    "can_elaborate": true,
+    "can_add_details": true,
+    "cannot_change": true,
+    "examples": {
+      "teacher": [
+        "English teacher",
+        "preschool teacher",
+        "high school teacher"
+      ],
+      "doctor": ["general practitioner", "pediatrician", "nurse"],
+      "student": ["part-time barista", "part-time retail", "part-time waitress"]
+    }
+  },
+  "logbook_categories": [
+    "Work",
+    "Sexual",
+    "Health",
+    "Update",
+    "Client_Work",
+    "Other"
+  ],
+  "response_limits": {
+    "min_characters": 150,
+    "max_characters": 500
+  },
+  "forbidden": {
+    "contact_info": ["phone", "email", "social media", "meet up"],
+    "external_platforms": [
+      "facebook",
+      "instagram",
+      "snapchat",
+      "whatsapp",
+      "telegram",
+      "kik",
+      "skype"
+    ]
+  }
+}
+
+
+

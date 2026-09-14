@@ -1,19 +1,20 @@
 {
+  "response_limits": { "min_characters": 150, "max_characters": 500 },
+  "followup_min_characters": 100,
   "profession_rules": {
     "single_profession": true,
     "can_elaborate": true,
-    "can_add_details": true,
-    "cannot_change": true,
-    "examples": {
-      "teacher": [
-        "English teacher",
-        "preschool teacher",
-        "high school teacher"
-      ],
-      "doctor": ["general practitioner", "pediatrician", "nurse"],
-      "student": ["part-time barista", "part-time retail", "part-time waitress"]
-    }
+    "cannot_change": true
   },
+  "default_professions": [
+    ["teacher", "English teacher"],
+    ["nurse", "pediatric nurse"],
+    ["receptionist", "hotel receptionist"],
+    ["waitress", "diner waitress"],
+    ["student", "part-time barista"],
+    ["hair stylist", "hair stylist at a small salon"],
+    ["store attendant", "store attendant at a pharmacy"]
+  ],
   "logbook_categories": [
     "Work",
     "Sexual",
@@ -21,21 +22,5 @@
     "Update",
     "Client_Work",
     "Other"
-  ],
-  "response_limits": {
-    "min_characters": 150,
-    "max_characters": 500
-  },
-  "forbidden": {
-    "contact_info": ["phone", "email", "social media", "meet up"],
-    "external_platforms": [
-      "facebook",
-      "instagram",
-      "snapchat",
-      "whatsapp",
-      "telegram",
-      "kik",
-      "skype"
-    ]
-  }
+  ]
 }

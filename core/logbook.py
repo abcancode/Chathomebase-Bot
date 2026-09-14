@@ -1,135 +1,122 @@
-"""Logbook for tracking invented details with categories."""
+"""Persistent memory of invented facts.
+
+Facts are scoped per PLAYER profile (a fact invented while playing 'Anna' must
+never leak into 'Sofia'), and per customer inside that. Files have no date in
+the name so consistency survives across days.
+"""
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
+
+def _slug(s: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (s or "unknown").lower()).strip("_") or "unknown"
+
+
+def _load(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARNING] Failed to load {path.name}: {e}")
+    return default
+
+
+def _save(path: Path, data):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARNING] Failed to save {path.name}: {e}")
 
 
 class Logbook:
-    """Tracks invented personal details for consistency across customers."""
-    
-    CATEGORIES = [
-        "Work",           # Player's profession details
-        "Sexual",         # Fantasies, preferences, experiences  
-        "Health",         # Health issues, conditions
-        "Update",         # Appointments, events, photos received
-        "Client_Work",    # Customer's profession
-        "Other"           # Anything else
-    ]
-    
-    def __init__(self, log_dir: Path, customer_name: str):
+    CATEGORIES = ["Work", "Sexual", "Health", "Update", "Client_Work", "Other"]
+
+    def __init__(self, log_dir: Path):
         self.log_dir = log_dir
-        self.customer_name = customer_name
-        self.log_file = log_dir / f"{customer_name}_{datetime.now().strftime('%Y%m%d')}.json"
+        self.player_name: Optional[str] = None
+        self.customer_name: Optional[str] = None
         self.entries: List[Dict] = []
-        self.player_facts: Dict[str, str] = {}  # Global player facts across all customers
-        self._load()
-        self._load_global_facts()
-    
-    def _load(self):
-        """Load existing logbook for this customer."""
-        try:
-            if self.log_file.exists():
-                with open(self.log_file, 'r') as f:
-                    self.entries = json.load(f)
-        except Exception as e:
-            print(f"[WARNING] Failed to load logbook: {e}")
-            self.entries = []
-    
-    def _load_global_facts(self):
-        """Load global player facts across all customers."""
-        global_file = self.log_dir / "player_facts.json"
-        try:
-            if global_file.exists():
-                with open(global_file, 'r') as f:
-                    self.player_facts = json.load(f)
-        except:
-            self.player_facts = {}
-    
-    def _save_global_facts(self):
-        """Save global player facts."""
-        global_file = self.log_dir / "player_facts.json"
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            with open(global_file, 'w') as f:
-                json.dump(self.player_facts, f, indent=2)
-        except Exception as e:
-            print(f"[WARNING] Failed to save global facts: {e}")
-    
-    def add_entry(self, category: str, comment: str, client: str = None):
-        """Add entry to logbook."""
+        self.customer_facts: Dict[str, str] = {}
+        self.player_facts: Dict[str, str] = {}
+        self.customer_file: Optional[Path] = None
+        self.facts_file: Optional[Path] = None
+
+    def bind(self, player_name: str, customer_name: str):
+        """Switch to a (player, customer) pair. Called on every new assignment."""
+        self.player_name, self.customer_name = player_name, customer_name
+        player_dir = self.log_dir / _slug(player_name)
+        self.customer_file = player_dir / f"{_slug(customer_name)}.json"
+        self.facts_file = player_dir / "player_facts.json"
+        data = _load(self.customer_file, {})
+        if isinstance(data, list):  # old format
+            data = {"facts": {}, "entries": data}
+        self.entries = data.get("entries", [])
+        self.customer_facts = data.get("facts", {})
+        self.player_facts = _load(self.facts_file, {})
+
+    def _persist(self):
+        if self.customer_file:
+            _save(self.customer_file, {"customer": self.customer_name, "facts": self.customer_facts,
+                                       "entries": self.entries})
+        if self.facts_file:
+            _save(self.facts_file, self.player_facts)
+
+    def add_entry(self, category: str, comment: str, client: Optional[str] = None):
         if category not in self.CATEGORIES:
             category = "Other"
-        
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "category": category,
-            "comment": comment,
-            "client": client or self.customer_name
-        }
-        self.entries.append(entry)
-        self._save()
-        
-        # If it's a player work fact, save globally
-        if category == "Work" and ":" in comment:
-            key = comment.split(":")[0].strip().lower()
-            value = comment.split(":", 1)[1].strip() if ":" in comment else comment
-            self.player_facts[key] = value
-            self._save_global_facts()
-    
-    def get_player_profession(self) -> Optional[str]:
-        """Get player's established profession."""
-        return self.player_facts.get("profession")
-    
-    def get_profession_detail(self, detail_type: str) -> Optional[str]:
-        """Get specific profession detail."""
-        return self.player_facts.get(f"profession_{detail_type}")
-    
-    def set_profession(self, base: str, detail: str = None, client: str = None):
-        """Set player's profession."""
+        if any(e["comment"] == comment for e in self.entries):
+            return
+        self.entries.append({"timestamp": datetime.now().isoformat(timespec="seconds"),
+                             "category": category, "comment": comment,
+                             "client": client or self.customer_name})
+        self._persist()
+
+    # player facts (global to this player profile)
+    def set_profession(self, base: str, detail: Optional[str] = None, client: Optional[str] = None):
         self.player_facts["profession"] = base
         if detail:
             self.player_facts["profession_detail"] = detail
-        
-        comment = f"Profession: {base}"
-        if detail:
-            comment += f" - {detail}"
-        
-        self.add_entry("Work", comment, client)
-        self._save_global_facts()
-    
+        self.add_entry("Work", f"Profession: {base}" + (f" - {detail}" if detail else ""), client)
+        self._persist()
+
+    def get_player_profession(self) -> Optional[str]:
+        return self.player_facts.get("profession")
+
+    def get_profession_detail(self, detail_type: str = "detail") -> Optional[str]:
+        return self.player_facts.get(f"profession_{detail_type}")
+
+    def set_player_fact(self, key: str, value: str):
+        self.player_facts[key] = value
+        self._persist()
+
+    # customer-scoped facts (e.g. which town we told THIS customer we live in)
+    def set_customer_fact(self, key: str, value: str):
+        self.customer_facts[key] = value
+        self._persist()
+
+    def get_customer_fact(self, key: str) -> Optional[str]:
+        return self.customer_facts.get(key)
+
     def get_facts_by_category(self, category: str) -> List[Dict]:
-        """Get all entries for a category."""
         return [e for e in self.entries if e["category"] == category]
-    
+
+    def all_entries(self) -> List[Dict]:
+        return self.entries
+
     def get_summary_for_prompt(self) -> str:
-        """Build summary for AI prompt."""
         lines = []
-        
-        # Work/Profession
         prof = self.get_player_profession()
         if prof:
-            detail = self.get_profession_detail("detail")
+            detail = self.get_profession_detail()
             lines.append(f"Work: {prof}" + (f" ({detail})" if detail else ""))
-        
-        # Recent entries by category
-        for cat in ["Sexual", "Health", "Update"]:
-            entries = self.get_facts_by_category(cat)[-3:]
-            for e in entries:
-                lines.append(f"{cat}: {e['comment'][:80]}")
-        
+        for k, v in self.customer_facts.items():
+            lines.append(f"{k.replace('_', ' ').title()}: {v}")
+        for cat in ("Sexual", "Health", "Update", "Client_Work"):
+            for e in self.get_facts_by_category(cat)[-3:]:
+                lines.append(f"{cat}: {e['comment'][:100]}")
         return "\n".join(lines) if lines else "No established facts yet."
-    
-    def _save(self):
-        """Save logbook."""
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.log_file, 'w') as f:
-                json.dump(self.entries, f, indent=2)
-        except Exception as e:
-            print(f"[WARNING] Failed to save logbook: {e}")
-    
-    def all_entries(self) -> List[Dict]:
-        """Get all entries."""
-        return self.entries

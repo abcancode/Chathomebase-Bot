@@ -1,0 +1,83 @@
+{
+  "_comment": "Edit after running INSPECT. First matching selector in each list wins. Verify close_banner does NOT match the button that closes the chat itself.",
+  "login": {
+    "url": "https://chathomebase.com/login",
+    "lobby_url": "https://chathomebase.com/chat/lobby",
+    "lobby_url_glob": "**/chat/**",
+    "email": ["input[name='email']", "input[type='email']"],
+    "password": ["input[name='password']", "input[type='password']"],
+    "submit": ["[data-testid='signInButton']", "button[type='submit']"],
+    "announcement_next": ["[data-testid='announcementsDialogNextButton']"],
+    "announcement_continue": [
+      "[data-testid='announcementsDialogContinueButton']"
+    ]
+  },
+  "chat": {
+    "message_bubbles": [".message-blob", ".chat-message"],
+    "message_text": [".message-content", ".text"],
+    "message_image": [
+      "img.message-image",
+      ".message-image img",
+      "[data-testid='messageImage']",
+      "img"
+    ],
+    "customer_class_markers": ["message-customer", "customer", "client"],
+    "player_class_markers": [
+      "message-entertainment",
+      "entertainment",
+      "player",
+      "operator"
+    ],
+    "history_class_markers": [
+      "old",
+      "previous",
+      "history",
+      "past",
+      "read-only",
+      "archived"
+    ],
+    "input": [
+      "[data-testid='messageTextArea']",
+      ".chat-input",
+      "textarea",
+      "[contenteditable='true']"
+    ],
+    "send": [
+      "[data-testid='sendChatMessageButton']",
+      ".send-button",
+      "button:has-text('Send')"
+    ],
+    "close_banner": [
+      "[data-testid='closeButton']",
+      "div[role='alert'] button",
+      "[aria-label='Close']",
+      ".warning-close",
+      "button:has-text('CLOSE')"
+    ],
+    "paste_warning": [
+      "[role='alert']",
+      ".alert",
+      ".toast",
+      ".notification",
+      ".warning",
+      ".error",
+      ".snackbar"
+    ],
+    "paste_warning_text": ["paste", "copy", "copied"]
+  },
+  "profiles": {
+    "customer": [
+      "[data-testid='customerProfile']",
+      ".customer-profile",
+      ".left-sidebar",
+      ".chat-sidebar-left"
+    ],
+    "player": [
+      "[data-testid='playerProfile']",
+      ".player-profile",
+      ".right-sidebar",
+      ".chat-sidebar-right",
+      ".entertainment-profile"
+    ]
+  }
+}

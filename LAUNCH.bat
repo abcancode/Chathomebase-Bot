@@ -2,7 +2,6 @@
 cd /d "%~dp0"
 title ChatHomeBase Bot
 
-:: Check if configured
 if not exist "config\settings.json" (
     echo =======================================
     echo Account not configured!
@@ -19,7 +18,7 @@ echo Starting ChatHomeBase Bot...
 echo =======================================
 echo.
 
-python launch_bot.py
+python launch_bot.py %*
 
 echo.
 echo Bot stopped.

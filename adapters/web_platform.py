@@ -1,931 +1,743 @@
-"""Web automation for chathomebase.com — Auto-assignment with profile scraping."""
+"""Web automation for chathomebase.com: auto-assignment, profile scraping, human-like replies."""
 
 import asyncio
+import hashlib
 import json
-import re
 import random
+import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
+from core.browser import launch_browser, INSPECTOR_JS
 from core.deepseek_client import DeepSeekClient
-from core.rule_guard import RuleGuard
+from core.excuse_bank import DynamicExcuseGenerator
+from core.google_geo import LocationFinder
+from core.humanizer import HumanTyper, normalize_for_typing
 from core.logbook import Logbook
 from core.prompt_builder import load_rules, build_system_prompt, build_history_messages
-from core.excuse_bank import DynamicExcuseGenerator
+from core.rule_guard import RuleGuard
+from core.timer_calculator import TimerCalculator
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+LOG_DIR = ROOT / "logs"
+
+PROFILE_PATTERNS = {
+    "name": [r"Name[:\s]+([A-Za-z][A-Za-z '\-]{1,40}?)\s*(?:\n|$)",
+             r"(?m)^([A-Z][A-Za-z'\-]+(?: [A-Z][A-Za-z'\-]+)?),\s*\d{2}\s*$"],
+    "age": [r"Age[:\s]+(\d{2})", r"(?m)^[A-Z][A-Za-z'\-]+(?: [A-Z][A-Za-z'\-]+)?,\s*(\d{2})\s*$",
+            r"\b(\d{2})\s*(?:years old|yrs|y/o|yo)\b"],
+    "location": [r"(?:Location|Lives in|City|From)[:\s]+([^\n]+)"],
+    "occupation": [r"(?:Occupation|Job|Work|Profession)[:\s]+([^\n]+)"],
+    "status": [r"\b(Single|Married|Divorced|Widowed|Separated)\b"],
+    "eyes": [r"\b(Blue|Brown|Green|Hazel|Grey|Gray)\s+eyes?\b"],
+    "hair": [r"\b(Blonde|Blond|Brunette|Red|Black|Brown|Grey|Gray)\s+hair\b"],
+    "body_type": [r"\b(Slim|Athletic|Curvy|Curvaceous|Average|Petite|Muscular)\b"],
+    "height": [r"(\d\s*ft\s*\d{0,2}\s*(?:in)?|\d{3}\s*cm)"],
+}
+SECTIONS = [("About me", "about_me"), ("About you", "about_you"), ("Hobbies", "hobbies"),
+            ("Interests", "hobbies"), ("Description", "about"), ("Bio", "about")]
+
+
+def log(level: str, msg: str):
+    print(f"[{datetime.now():%H:%M:%S}] [{level}] {msg}")
+
+
+def parse_profile(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not text:
+        return out
+    for field, patterns in PROFILE_PATTERNS.items():
+        for p in patterns:
+            m = re.search(p, text, re.I)
+            if m:
+                out[field] = m.group(1).strip()
+                break
+    for label, key in SECTIONS:
+        m = re.search(rf"{re.escape(label)}[:\s]*\n?([^\n]+)", text, re.I)
+        if m and key not in out:
+            out[key] = m.group(1).strip()
+    if "name" not in out:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if lines and len(lines[0]) <= 30 and re.fullmatch(r"[A-Za-z][A-Za-z '\-]*", lines[0]) \
+                and lines[0].lower() not in ("profile", "customer", "about me", "player"):
+            out["name"] = lines[0]
+    return out
+
+
+def parse_proxy(proxy: Optional[dict]) -> Optional[dict]:
+    if not proxy or not proxy.get("server"):
+        return None
+    url = proxy["server"]
+    if "@" in url:
+        p = urlparse(url)
+        return {"server": f"{p.scheme}://{p.hostname}:{p.port}", "username": p.username, "password": p.password}
+    return {"server": url}
 
 
 class ChatHomeBaseAdapter:
-    """Auto-assignment bot that scrapes profiles from platform."""
-    
-    def __init__(self, settings: dict, dry_run: bool = False):
+    def __init__(self, settings: dict, dry_run: bool = False, inspect: bool = False):
         self.settings = settings
         self.dry_run = dry_run
-        
-        # Parse proxy if provided
-        self.proxy = settings.get("proxy")
-        self.proxy_config = None
-        if self.proxy and self.proxy.get("server"):
-            proxy_url = self.proxy["server"]
-            if "@" in proxy_url:
-                parsed = urlparse(proxy_url)
-                self.proxy_config = {
-                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                    "username": parsed.username,
-                    "password": parsed.password
-                }
-            else:
-                self.proxy_config = {"server": proxy_url}
-        
-        # Bot brain
-        data_dir = Path(__file__).parent.parent / "data"
-        log_dir = Path(__file__).parent.parent / "logs" / "logbooks"
-        
-        self.rules = load_rules(data_dir / "rules.json")
-        self.guard = RuleGuard(
-            data_dir / "rules.json",
-            data_dir / "banned_phrases.json",
-            "Customer"
-        )
-        self.deepseek = DeepSeekClient(
-            api_key=settings["deepseek_api_key"],
-            guard=self.guard,
-            low_balance_threshold_usd=settings.get("deepseek_low_balance_threshold_usd", 4.0),
-            max_retries=3
-        )
-        self.logbook = Logbook(log_dir, settings.get("customer_name", "Customer"))
-        
-        # Excuse generator for follow-ups
-        self.excuse_generator = DynamicExcuseGenerator(
-            self.deepseek,
-            settings.get("player_occupation", "")
-        )
-        
-        # Telegram - Optional
-        self.telegram_enabled = False
-        self.notifier = None
-        self.telegram_user_id = None
-        if settings.get("telegram_user_id") and settings.get("telegram_bot_token"):
-            try:
-                from telegram_notify.notifier import TelegramNotifier
-                self.notifier = TelegramNotifier(settings.get("telegram_bot_token"))
-                self.telegram_user_id = settings.get("telegram_user_id")
-                self.telegram_enabled = True
-            except ImportError:
-                print("[WARNING] telegram_notify not installed. Notifications disabled.")
-        
-        # OpenAI for vision
-        self.openai_enabled = bool(settings.get("openai_api_key"))
+        self.inspect = inspect
+        self.proxy_config = parse_proxy(settings.get("proxy"))
+        self.sel = json.loads((DATA_DIR / "selectors.json").read_text(encoding="utf-8"))
+
+        self.rules = load_rules(DATA_DIR / "rules.json")
+        self.guard = RuleGuard(DATA_DIR / "rules.json", DATA_DIR / "banned_phrases.json")
+        self.deepseek = DeepSeekClient(settings["deepseek_api_key"],
+                                       settings.get("deepseek_low_balance_threshold_usd", 4.0))
+        self.logbook = Logbook(LOG_DIR / "logbooks")
+        self.timer = TimerCalculator()
+        self.excuse_generator = DynamicExcuseGenerator(self.deepseek, "", self.guard.followup_min_chars, self.guard.max_chars)
+        self.geo = LocationFinder(settings["google_api_key"]) if settings.get("google_api_key") else None
         self.openai_key = settings.get("openai_api_key")
-        
-        # Web
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        
-        # Scraped profiles
+
+        self.notifier = None
+        if settings.get("telegram_user_id") and settings.get("telegram_bot_token"):
+            from telegram_notify.notifier import TelegramNotifier
+            self.notifier = TelegramNotifier(settings["telegram_bot_token"])
+        self._notified: Dict[str, float] = {}
+
+        self.playwright = None
+        self.context = None
+        self.page = None
+        self.typer: Optional[HumanTyper] = None
+
         self.customer_profile: Dict = {}
         self.player_profile: Dict = {}
-        
+        self._current_customer_key: Optional[str] = None
+        self._last_sig: Optional[Tuple] = None
+        self._awaiting_since: Optional[float] = None
+        self._followup_sent = False
+        self._image_cache: Dict[str, str] = {}
+        self._max_cache_size = 100  # Limit cache size to prevent memory issues
+
+    # ------------------------------------------------------------------ lifecycle
     async def start(self):
-        """Launch and process assignments."""
-        print(f"\n{'='*60}")
-        print(f"ChatHomeBase Bot")
-        print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
-        print(f"{'='*60}\n")
-        
-        self.playwright = await async_playwright().start()
-        
-        self.browser = await self.playwright.chromium.launch(
-            headless=False, 
-            proxy=self.proxy_config,
-            args=[
-                "--force-device-scale-factor=1.0",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-                "--disable-webgl",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-                "--start-maximized",
-                "--disable-extensions",
-                "--disable-default-apps",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding"
-            ],
-            slow_mo=100
-        )
-        
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1000},
-            screen={"width": 1920, "height": 1080},
-            proxy=self.proxy_config,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0"
-        )
-        
-        self.page = await self.context.new_page()
-        
-        await self._maximize_window()
-        
+        mode = "INSPECT" if self.inspect else ("DRY RUN" if self.dry_run else "LIVE")
+        print(f"\n{'=' * 60}\nChatHomeBase Bot   Mode: {mode}\n{'=' * 60}\n")
+
+        self.playwright, self.context, self.page = await launch_browser(
+            ROOT / "profile", self.proxy_config, inspect=self.inspect,
+            channel=self.settings.get("browser_channel"), user_agent=self.settings.get("user_agent"))
+        self.typer = HumanTyper(self.page,
+                                (self.settings.get("typing_cpm_min", 190), self.settings.get("typing_cpm_max", 260)))
+        if self.inspect:
+            await self.page.expose_function("chbLog", lambda m: print(f"      [PAGE] {m}"))
+            await self.page.add_init_script(INSPECTOR_JS)
+
         await self._check_balance()
-        
-        logged_in = False
+
         for attempt in range(3):
             try:
-                logged_in = await self._login()
-                if logged_in:
+                if await self._login():
                     break
-            except Exception as e:
-                print(f"[WARNING] Login attempt {attempt+1} failed: {e}")
-                if attempt < 2:
-                    print("[INFO] Retrying in 5 seconds...")
-                    await asyncio.sleep(5)
-        
-        if not logged_in:
-            print("[ERROR] Could not log in after 3 attempts")
-            await self.stop()
+            except Exception as e:  # noqa: BLE001
+                log("WARNING", f"Login attempt {attempt + 1} failed: {e}")
+                await self._screenshot("login_failed")
+                await asyncio.sleep(5)
+        else:
+            log("ERROR", "Could not log in after 3 attempts")
+            self._notify("login", "ChatHomeBase bot could not log in after 3 attempts.")
             return
-        
-        print("[INFO] Waiting for chat assignments...")
-        print("        (Profiles will be scraped when chat loads)\n")
-        
+
+        if self.inspect:
+            await self._inspection_session()
+
+        log("INFO", "Waiting for chat assignments...")
         await self._process_assignments()
-    
-    async def _maximize_window(self):
-        """Maximize browser window."""
+
+    async def stop(self):
         try:
-            screen_size = await self.page.evaluate("""() => {
-                return {
-                    width: window.screen.availWidth,
-                    height: window.screen.availHeight
-                };
-            }""")
-            
-            await self.page.set_viewport_size({
-                "width": screen_size["width"],
-                "height": screen_size["height"] - 40
-            })
-            
-            await self.page.evaluate("""() => {
-                window.moveTo(0, 0);
-                window.resizeTo(screen.availWidth, screen.availHeight);
-            }""")
-            
-            print(f"[INFO] Window maximized to {screen_size['width']}x{screen_size['height']}")
-        except Exception as e:
-            print(f"[WARNING] Could not maximize window: {e}")
-    
-    async def _close_warnings(self):
-        """Close any warning banners/popups."""
-        try:
-            close_selectors = [
-                "button:has-text('CLOSE')",
-                "button:has-text('Close')",
-                "[data-testid='closeButton']",
-                ".close-button",
-                "button.close",
-                "div[role='alert'] button",
-                ".warning-close",
-                "[aria-label='Close']"
-            ]
-            
-            for selector in close_selectors:
+            if self.context:
+                await self.context.close()
+        finally:
+            if self.playwright:
+                await self.playwright.stop()
+
+    # ------------------------------------------------------------------ helpers
+    async def _first(self, selectors: List[str], timeout_ms: int = 1500):
+        deadline = time.time() + timeout_ms / 1000
+        while True:
+            for s in selectors:
                 try:
-                    close_btn = await self.page.query_selector(selector)
-                    if close_btn:
-                        await close_btn.click(timeout=1000)
-                        print("[INFO] Closed warning banner")
-                        await asyncio.sleep(0.5)
-                        break
-                except:
+                    loc = self.page.locator(s).first
+                    if await loc.count() and await loc.is_visible():
+                        return loc
+                except Exception:  # noqa: BLE001
                     continue
-        except:
-            pass
-    
-    async def _scroll_to_bottom(self):
-        """Scroll chat to bottom."""
+            if time.time() >= deadline:
+                return None
+            await asyncio.sleep(0.2)
+
+    async def _first_text(self, selectors: List[str], timeout_ms: int = 1500) -> str:
+        loc = await self._first(selectors, timeout_ms)
         try:
-            await self._close_warnings()
-            
-            for _ in range(3):
-                await self.page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
-                await asyncio.sleep(0.3)
-            
-            chat_selectors = [
-                ".chat-container",
-                ".messages-container", 
-                "[data-testid='chatMessages']",
-                ".message-list",
-                ".chat-messages"
-            ]
-            
-            for selector in chat_selectors:
-                try:
-                    chat_container = await self.page.query_selector(selector)
-                    if chat_container:
-                        await chat_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-                        await asyncio.sleep(0.3)
-                except:
-                    continue
-            
-            await self.page.keyboard.press("End")
-            await asyncio.sleep(0.3)
-        except:
-            pass
-    
-    async def _ensure_input_visible(self):
-        """Ensure typing input is visible on screen."""
-        try:
-            await self._close_warnings()
-            
-            input_selectors = [
-                "[data-testid='messageTextArea']",
-                ".chat-input",
-                "textarea",
-                "input[type='text']",
-                "[contenteditable='true']"
-            ]
-            
-            for selector in input_selectors:
-                try:
-                    element = await self.page.query_selector(selector)
-                    if element:
-                        await element.evaluate("el => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
-                        await asyncio.sleep(0.5)
-                        return True
-                except:
-                    continue
-            
-            await self._scroll_to_bottom()
+            return (await loc.inner_text()) if loc else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _click_first(self, selectors: List[str], timeout_ms: int = 1500) -> bool:
+        loc = await self._first(selectors, timeout_ms)
+        if not loc:
             return False
-        except:
+        try:
+            await loc.click(timeout=2000)
+            return True
+        except Exception:  # noqa: BLE001
             return False
+
+    async def _dismiss_dialogs(self):
+        L, C = self.sel["login"], self.sel["chat"]
+        for _ in range(5):
+            if not await self._click_first(L["announcement_next"], 400):
+                break
+            await asyncio.sleep(0.4)
+        await self._click_first(L["announcement_continue"], 400)
+        if await self._click_first(C["close_banner"], 300):
+            log("INFO", "Closed a banner")
+
+    async def _screenshot(self, tag: str):
+        try:
+            d = LOG_DIR / "screens"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.png"
+            await self.page.screenshot(path=str(path), full_page=False)
+            log("INFO", f"Screenshot: {path.name}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _notify(self, key: str, text: str, cooldown: int = 1800):
+        if not self.notifier:
+            return
+        if time.time() - self._notified.get(key, 0) < cooldown:
+            return
+        self._notified[key] = time.time()
+        self.notifier.send(self.settings["telegram_user_id"], text)
+
+    async def _check_balance(self):
+        balance = await asyncio.to_thread(self.deepseek.check_balance)
+        log("INFO", f"DeepSeek balance: ${balance:.2f}")
+        threshold = self.settings.get("deepseek_low_balance_threshold_usd", 4.0)
+        if balance < threshold and self.notifier:
+            self.notifier.notify_low_balance(self.settings["telegram_user_id"], balance, threshold)
+
+    # ------------------------------------------------------------------ login
+    async def _login(self) -> bool:
+        L = self.sel["login"]
+        log("INFO", "Checking session...")
         
+        # FORCE BROWSER TO FRONT TO SEE WHAT'S HAPPENING
+        await self.page.bring_to_front()
+        await asyncio.sleep(1.0)
+        
+        # CHECK 1: Are we on the Lobby? (Definitive logged in)
+        if "lobby" in self.page.url:
+            log("INFO", "Found lobby URL - already logged in")
+            await self._dismiss_dialogs()
+            return True
+            
+        # CHECK 2: Are we on a chat page with your username?
+        if "/chat/" in self.page.url and "login" not in self.page.url:
+            try:
+                # Look for any chat interface elements
+                chat_elements = await self.page.query_selector_all(
+                    ".message-blob, .chat-message, .customer-profile, [class*='profile']"
+                )
+                if chat_elements:
+                    log("INFO", "Found chat elements - already logged in")
+                    await self._dismiss_dialogs()
+                    return True
+            except:
+                pass
+            
+            # CHECK 3: Look for your specific username in the page text
+            try:
+                body_text = await self.page.inner_text("body")
+                if "USETN4650774" in body_text:  # Your username
+                    log("INFO", "Found your username in page - already logged in")
+                    await self._dismiss_dialogs()
+                    return True
+            except:
+                pass
+            
+            # CHECK 4: Look for a logout button
+            try:
+                logout = await self.page.query_selector(
+                    "button:has-text('Logout'), button:has-text('Sign out'), [data-testid='logoutButton']"
+                )
+                if logout:
+                    log("INFO", "Found logout button - already logged in")
+                    await self._dismiss_dialogs()
+                    return True
+            except:
+                pass
+
+        # If we are here, we are DEFINITELY not logged in. Proceed with login.
+        log("INFO", "Not logged in. Navigating to login page...")
+        
+        # Make sure browser is visible
+        await self.page.bring_to_front()
+        await asyncio.sleep(1.5)
+        
+        await self.page.goto(L["url"], wait_until="domcontentloaded")
+        await asyncio.sleep(2.0)  # Wait to see the login page
+        
+        # Human-like delays between actions
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        email = await self._first(L["email"], 10000)
+        password = await self._first(L["password"], 3000)
+        if not email or not password:
+            raise RuntimeError(f"Login form not found at {self.page.url}")
+            
+        await email.click()
+        await self.typer.type(self.settings["chathomebase_login"], typos=False)
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        
+        await password.click()
+        await self.typer.type(self.settings["chathomebase_password"], typos=False)
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        
+        if not await self._click_first(L["submit"], 2000):
+            await self.page.keyboard.press("Enter")
+            
+        await self.page.wait_for_url(L["lobby_url_glob"], timeout=30000)
+        log("INFO", "Successfully logged in")
+        await self._dismiss_dialogs()
+        return True
+    
+    # ------------------------------------------------------------------ main loop
+    async def _signature(self) -> Optional[Tuple[str, int, str]]:
+        C = self.sel["chat"]
+        bubbles = await self.page.query_selector_all(", ".join(C["message_bubbles"]))
+        if not bubbles:
+            return None
+        try:
+            last_text = (await bubbles[-1].inner_text() or "")[:200]
+        except Exception:  # noqa: BLE001
+            last_text = ""
+        cust = (await self._first_text(self.sel["profiles"]["customer"], 300))[:150]
+        h = lambda s: hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()[:8]  # noqa: E731
+        return (h(cust), len(bubbles), h(last_text))
+
     async def _process_assignments(self):
-        """Process chat assignments."""
+        errors = 0
         while True:
             try:
-                if not await self._wait_for_assignment():
+                sig = await self._signature()
+                if sig is None:
+                    if self._current_customer_key:
+                        log("INFO", "Chat closed. Waiting for next assignment...")
+                        self._current_customer_key = None
+                        self._last_sig = None
                     await asyncio.sleep(2)
                     continue
-                
-                print(f"\n{'='*60}")
-                print(f"New Assignment")
-                print(f"{'='*60}")
-                
-                self.customer_profile = await self._extract_customer_profile()
-                self.player_profile = await self._extract_player_profile()
-                
-                self.excuse_generator = DynamicExcuseGenerator(
-                    self.deepseek,
-                    self.player_profile.get("occupation", self.settings.get("player_occupation", ""))
-                )
-                
-                platform_history = await self._read_platform_history()
-                
-                self.settings["player_name"] = self.player_profile.get("name", "Player")
-                self.settings["player_occupation"] = self.player_profile.get("occupation", "Worker")
-                self.guard.customer_first_name = self.customer_profile.get("name", "Customer").split()[0]
-                
-                print(f"[INFO] Player: {self.player_profile.get('name')}")
-                print(f"[INFO] Customer: {self.customer_profile.get('name')}")
-                
-                if platform_history:
-                    print(f"[INFO] Previous conversation: {len(platform_history)} messages")
-                    await self._extract_facts_from_history(platform_history)
-                
-                await self._process_current_chat()
-                await self._wait_for_chat_close()
-                print("[INFO] Waiting for next assignment...")
-                
-            except Exception as e:
-                print(f"[ERROR] {e}")
+
+                if sig[0] != self._current_customer_key:
+                    await self._load_assignment(sig[0])
+
+                if sig == self._last_sig:
+                    await self._maybe_followup()
+                    await asyncio.sleep(2)
+                    continue
+
+                await asyncio.sleep(1.0)  # let the DOM settle (typing indicators, images)
+                conversation = await self._read_conversation()
+                if conversation:
+                    await self._process_current_chat(conversation)
+                self._last_sig = await self._signature()
+                errors = 0
+            except TimeoutError as e:  # noqa: BLE001
+                errors += 1
+                log("WARNING", f"Timeout error: {e}")
+                await self._screenshot("timeout")
+                if errors >= 3:
+                    self._notify("timeouts", f"ChatHomeBase bot: {errors} consecutive timeouts. Last: {e}")
                 await asyncio.sleep(5)
-                
-    async def _extract_customer_profile(self) -> Dict:
-        """Scrape customer profile from LEFT sidebar."""
-        profile = {}
-        
-        try:
-            selectors = [
-                "[data-testid='customerProfile']",
-                ".customer-profile",
-                ".left-sidebar",
-                ".chat-sidebar-left"
-            ]
-            
-            profile_text = ""
-            for selector in selectors:
-                try:
-                    profile_text = await self.page.inner_text(selector, timeout=30000)
-                    if profile_text:
-                        break
-                except:
-                    continue
-            
-            patterns = {
-                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
-                "age": r'Age[:\s]+(\d+)',
-                "location": r'Location[:\s]+([^\n]+)',
-                "occupation": r'Occupation[:\s]+([^\n]+)',
-                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
-                "height": r'(\d+ft[\s\din-]+)',
-                "body_type": r'(Slim|Athletic|Curvaceous|Average)',
-                "status": r'(Single|Married|Divorced)',
-            }
-            
-            for field, pattern in patterns.items():
-                match = re.search(pattern, profile_text, re.IGNORECASE)
-                if match:
-                    profile[field] = match.group(1).strip()
-            
-            for section in ["About me", "About you", "Hobbies"]:
-                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
-                if match:
-                    profile[section.lower().replace(" ", "_")] = match.group(1).strip()
-                    
-        except Exception as e:
-            print(f"[WARNING] Customer profile error: {e}")
-            profile["name"] = "Customer"
-        
-        return profile
-        
-    async def _extract_player_profile(self) -> Dict:
-        """Scrape PLAYER profile from RIGHT sidebar."""
-        profile = {}
-        
-        try:
-            selectors = [
-                "[data-testid='playerProfile']",
-                ".player-profile",
-                ".right-sidebar",
-                ".chat-sidebar-right",
-                ".entertainment-profile"
-            ]
-            
-            profile_text = ""
-            for selector in selectors:
-                try:
-                    profile_text = await self.page.inner_text(selector, timeout=2000)
-                    if profile_text:
-                        break
-                except:
-                    continue
-            
-            patterns = {
-                "name": r'Name[:\s]+([A-Za-z\s]+?)(?=\n|Age|Location|$)',
-                "age": r'Age[:\s]+(\d+)',
-                "occupation": r'Occupation[:\s]+([^\n]+)',
-                "location": r'Location[:\s]+([^\n]+)',
-                "eyes": r'(Blue|Brown|Green|Hazel) eyes?',
-                "hair": r'(Blonde|Brunette|Red|Black|Brown) hair?',
-                "body_type": r'(Slim|Athletic|Curvy|Average)',
-            }
-            
-            for field, pattern in patterns.items():
-                match = re.search(pattern, profile_text, re.IGNORECASE)
-                if match:
-                    profile[field] = match.group(1).strip()
-            
-            for section in ["About me", "Description", "Bio"]:
-                match = re.search(f'{section}[:\s]*\n?([^\\n]+)', profile_text, re.IGNORECASE)
-                if match:
-                    profile["about"] = match.group(1).strip()
-            
-            if not profile.get("name"):
-                profile["name"] = self.settings.get("player_name") or "Player"
-            if not profile.get("occupation"):
-                profile["occupation"] = self.settings.get("player_occupation") or "Worker"
-            if not profile.get("location"):
-                profile["location"] = self.settings.get("player_location_cached")
-                
-        except Exception as e:
-            print(f"[WARNING] Player profile error: {e}")
-            profile = {
-                "name": self.settings.get("player_name", "Player"),
-                "occupation": self.settings.get("player_occupation", "Worker"),
-                "location": self.settings.get("player_location_cached")
-            }
-        
-        return profile
-        
-    async def _process_current_chat(self):
-        """Process chat."""
-        await self._close_warnings()
-        
-        conversation = await self._read_conversation_history()
-        print(f"[INFO] History: {len(conversation)} messages")
-        
-        if not conversation:
+            except ConnectionError as e:  # noqa: BLE001
+                errors += 1
+                log("WARNING", f"Connection error: {e}")
+                await self._screenshot("connection_error")
+                if errors >= 3:
+                    self._notify("connection", f"ChatHomeBase bot: {errors} connection errors. Last: {e}")
+                await asyncio.sleep(10)
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                log("ERROR", f"{type(e).__name__}: {e}")
+                await self._screenshot("error")
+                if errors >= 5:
+                    self._notify("errors", f"ChatHomeBase bot: {errors} consecutive errors. Last: {e}")
+                await asyncio.sleep(5)
+
+    async def _load_assignment(self, customer_key: str):
+        print(f"\n{'=' * 60}\nNew assignment\n{'=' * 60}")
+        self._current_customer_key = customer_key
+        self._awaiting_since = None
+        self._followup_sent = False
+
+        self.customer_profile = parse_profile(await self._first_text(self.sel["profiles"]["customer"], 8000))
+        self.player_profile = parse_profile(await self._first_text(self.sel["profiles"]["player"], 3000))
+        self.customer_profile.setdefault("name", "Customer")
+        self.player_profile.setdefault("name", self.settings.get("player_name") or "Player")
+        self.player_profile.setdefault("occupation", self.settings.get("player_occupation") or "Worker")
+
+        self.logbook.bind(self.player_profile["name"], self.customer_profile["name"])
+        self.guard.set_customer_name(self.customer_profile["name"])
+
+        # profession: platform profile > established fact > (later, only if asked) invented
+        if self.player_profile.get("occupation", "").lower() in ("", "worker") and self.logbook.get_player_profession():
+            self.player_profile["occupation"] = self.logbook.get_profession_detail() or self.logbook.get_player_profession()
+        elif self.player_profile.get("occupation", "").lower() not in ("", "worker") and not self.logbook.get_player_profession():
+            self.logbook.set_profession(self.player_profile["occupation"])
+
+        # location: platform profile > what we already told this customer > nearby town via Google
+        if not self.player_profile.get("location"):
+            loc = self.logbook.get_customer_fact("player_location")
+            if not loc and self.geo and self.customer_profile.get("location"):
+                loc = await asyncio.to_thread(self.geo.get_nearby_city, self.customer_profile["location"],
+                                              int(self.settings.get("nearby_miles", 40)))
+                if loc:
+                    self.logbook.set_customer_fact("player_location", loc)
+                    log("INFO", f"Picked nearby town for player: {loc}")
+            if loc:
+                self.player_profile["location"] = loc
+
+        self.excuse_generator = DynamicExcuseGenerator(self.deepseek, self.player_profile.get("occupation", ""),
+                                                       self.guard.followup_min_chars, self.guard.max_chars)
+        log("INFO", f"Player: {self.player_profile.get('name')} | {self.player_profile.get('occupation')} | {self.player_profile.get('location')}")
+        log("INFO", f"Customer: {self.customer_profile.get('name')} | {self.customer_profile.get('location', '?')} | age {self.customer_profile.get('age', '?')}")
+
+        history = await self._read_conversation(historical_only=True)
+        if history:
+            log("INFO", f"Previous conversation: {len(history)} messages")
+            self._extract_facts_from_history(history)
+
+    async def _process_current_chat(self, conversation: List[Dict]):
+        last = conversation[-1]
+        if last["speaker"] == "customer":
+            log("INFO", f"Customer: {last['text'][:80]}")
+            self._awaiting_since = None
+            self._note_customer_info(last["text"])
+            await asyncio.sleep(self.timer.reading_delay(len(last["text"])))
+            reply = await self._generate_reply(last, conversation)
+            if reply and await self._deliver(reply):
+                self._awaiting_since = time.time()
             return
-        
-        last_msg = conversation[-1]
-        
-        if last_msg["speaker"] == "customer":
-            print(f"[INFO] Customer: {last_msg['text'][:60]}...")
-            await self._check_for_new_info(last_msg["text"])
-            await self._generate_response(last_msg, conversation, is_follow_up=False)
-            
-        elif last_msg["speaker"] == "player":
-            consecutive_player = 0
-            for msg in reversed(conversation):
-                if msg["speaker"] == "player":
-                    consecutive_player += 1
+
+        # Last message is ours.
+        consecutive = 0
+        for m in reversed(conversation):
+            if m["speaker"] != "player":
+                break
+            consecutive += 1
+        if consecutive >= 2 or self._followup_sent:
+            log("INFO", "Follow-up already sent, waiting for the customer...")
+            return
+        if self._awaiting_since is not None:
+            return  # we just replied; the timer in _maybe_followup handles nudging
+        # Fresh assignment where the customer went quiet on our last message: one poke.
+        log("INFO", "Customer quiet on assignment, sending one re-engagement message...")
+        await self._send_follow_up(conversation)
+
+    async def _maybe_followup(self):
+        minutes = float(self.settings.get("followup_after_minutes", 0) or 0)
+        if minutes <= 0 or self._followup_sent or self._awaiting_since is None:
+            return
+        if time.time() - self._awaiting_since >= minutes * 60:
+            log("INFO", f"No reply for {minutes:g} min, sending one follow-up...")
+            await self._send_follow_up(await self._read_conversation())
+
+    # ------------------------------------------------------------------ scraping
+    async def _read_conversation(self, historical_only: bool = False) -> List[Dict]:
+        C = self.sel["chat"]
+        bubbles = await self.page.query_selector_all(", ".join(C["message_bubbles"]))
+        messages: List[Dict] = []
+        for b in bubbles:
+            try:
+                classes = (await b.get_attribute("class") or "").lower()
+                is_hist = any(m in classes for m in C["history_class_markers"])
+                if historical_only and not is_hist:
+                    continue
+                if any(m in classes for m in C["customer_class_markers"]):
+                    speaker = "customer"
+                elif any(m in classes for m in C["player_class_markers"]):
+                    speaker = "player"
                 else:
+                    continue
+                text_el = await b.query_selector(", ".join(C["message_text"]))
+                text = ((await text_el.inner_text()) if text_el else (await b.inner_text())).strip()
+                if speaker == "customer":
+                    img = await b.query_selector(", ".join(C["message_image"]))
+                    if img:
+                        src = await img.get_attribute("src")
+                        if src and not src.startswith("data:image/svg") and "avatar" not in src.lower():
+                            text = f"{text} [Customer shared a photo: {await self._analyze_image(src)}]".strip()
+                if text:
+                    messages.append({"speaker": speaker, "text": text, "historical": is_hist})
+            except Exception:  # noqa: BLE001
+                continue
+        return messages
+
+    async def _analyze_image(self, url: str) -> str:
+        # Check cache first
+        if url in self._image_cache:
+            return self._image_cache[url]
+        
+        desc = "photo"
+        if self.openai_key:
+            try:
+                data_url = await self.page.evaluate(
+                    """async (u) => { const r = await fetch(u); const b = await r.blob();
+                       return await new Promise(res => { const fr = new FileReader();
+                       fr.onloadend = () => res(fr.result); fr.readAsDataURL(b); }); }""", url)
+                if data_url and str(data_url).startswith("data:"):
+                    import openai
+                    client = openai.AsyncOpenAI(api_key=self.openai_key)
+                    r = await client.chat.completions.create(
+                        model=self.settings.get("openai_vision_model", "gpt-4o-mini"),
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": "Describe this photo in one short factual sentence: who or what is shown, setting, notable details. Under 25 words."},
+                            {"type": "image_url", "image_url": {"url": data_url}}]}],
+                        max_tokens=60)
+                    desc = r.choices[0].message.content.strip()
+                    log("INFO", f"Image: {desc[:70]}")
+            except Exception as e:  # noqa: BLE001
+                log("WARNING", f"Image analysis failed: {e}")
+        
+        # Add to cache with size limit
+        self._image_cache[url] = desc
+        if len(self._image_cache) > self._max_cache_size:
+            # Remove oldest entry if cache is full
+            oldest_key = next(iter(self._image_cache))
+            del self._image_cache[oldest_key]
+            
+        return desc
+
+    # ------------------------------------------------------------------ memory
+    def _extract_facts_from_history(self, history: List[Dict]):
+        for msg in (m["text"] for m in history if m["speaker"] == "player"):
+            low = msg.lower()
+            for p in (r"i am an? ([\w\s]+?)(?:\.|,|$)", r"i'm an? ([\w\s]+?)(?:\.|,|$)",
+                      r"i work as an? ([\w\s]+?)(?:\.|,|$)", r"my job is ([\w\s]+?)(?:\.|,|$)"):
+                m = re.search(p, low)
+                if m and not self.logbook.get_player_profession() and len(m.group(1)) < 40:
+                    self.logbook.set_profession(m.group(1).strip())
+                    log("INFO", f"Profession from history: {m.group(1).strip()}")
                     break
-            
-            if consecutive_player >= 2:
-                print("[INFO] Already sent follow-up, waiting...")
-                return
-            
-            print("[INFO] Sending follow-up...")
-            category = self._classify(last_msg["text"]) if last_msg["text"] else "casual"
-            await self._send_follow_up_with_excuse(category)
-        
-    async def _send_follow_up_with_excuse(self, category: str = "casual"):
-        """Send follow-up message."""
-        excuse = self.excuse_generator.generate_excuse(category)
-        
-        if excuse:
-            print(f"[INFO] Generated excuse: {excuse[:80]}...")
-            await self._type_response(excuse)
-            await self._send_response()
-        else:
-            fallbacks = [
-                "Hey, you still there? What are you thinking about?",
-                "Got quiet on me. What's on your mind?",
-                "Still around? Tell me something interesting."
-            ]
-            msg = random.choice(fallbacks)
-            print(f"[INFO] Fallback follow-up: {msg}")
-            await self._type_response(msg)
-            await self._send_response()
-        
-    async def _check_for_new_info(self, customer_msg: str):
-        """Check if customer asks for info."""
-        customer_lower = customer_msg.lower()
-        
-        if any(word in customer_lower for word in ["work", "job", "do for a living", "what do you do", "profession", "career"]):
-            existing_prof = self.logbook.get_player_profession()
-            
-            if existing_prof:
-                detail = self.logbook.get_profession_detail("detail")
-                if not detail:
-                    details = {
-                        "teacher": ["English teacher", "preschool teacher", "high school math teacher"],
-                        "doctor": ["general practitioner", "pediatrician", "nurse practitioner"],
-                        "student": ["part-time barista", "part-time retail", "part-time tutor"],
-                        "unemployed": ["between jobs", "looking for opportunities", "taking time off"]
-                    }
-                    base = existing_prof.lower()
-                    if base in details:
-                        detail = random.choice(details[base])
-                        self.logbook.set_profession(existing_prof, detail, self.customer_profile.get("name"))
-                        print(f"[INFO] Detailed profession: {detail}")
-            else:
-                professions = [
-                    ("teacher", "English teacher"),
-                    ("nurse", "pediatric nurse"),
-                    ("receptionist", "hotel receptionist"),
-                    ("waitress", "diner waitress"),
-                    ("student", "part-time barista")
-                ]
-                base, detail = random.choice(professions)
-                self.logbook.set_profession(base, detail, self.customer_profile.get("name"))
+            for p in (r"i live in ([\w\s,]+?)(?:\.|$)", r"i'm from ([\w\s,]+?)(?:\.|$)", r"i am from ([\w\s,]+?)(?:\.|$)"):
+                m = re.search(p, low)
+                if m and not self.logbook.get_customer_fact("player_location"):
+                    self.logbook.set_customer_fact("player_location", m.group(1).strip().title())
+                    log("INFO", f"Location from history: {m.group(1).strip()}")
+                    break
+
+    def _note_customer_info(self, text: str):
+        low = text.lower()
+        cust = self.customer_profile.get("name")
+        if any(w in low for w in ("your work", "your job", "do for a living", "what do you do", "profession", "career")):
+            prof = self.logbook.get_player_profession()
+            if not prof and self.player_profile.get("occupation", "").lower() not in ("", "worker"):
+                self.logbook.set_profession(self.player_profile["occupation"], client=cust)
+            elif not prof:
+                base, detail = random.choice(self.rules.get("default_professions", [["teacher", "English teacher"]]))
+                self.logbook.set_profession(base, detail, cust)
                 self.player_profile["occupation"] = detail
-                print(f"[INFO] Set profession: {detail}")
-        
-        if any(phrase in customer_lower for phrase in ["i am a", "i work as", "my job is", "i'm a"]):
-            patterns = [
-                r'i am a[n]? ([\w\s]+)',
-                r'i work as a[n]? ([\w\s]+)',
-                r'my job is ([\w\s]+)',
-                r'i\'m a[n]? ([\w\s]+)'
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, customer_lower)
-                if match:
-                    client_prof = match.group(1).strip()
-                    self.logbook.add_entry("Client_Work", f"Client profession: {client_prof}", self.customer_profile.get("name"))
-                    print(f"[INFO] Recorded client profession: {client_prof}")
-                    break
-        
-        if any(word in customer_lower for word in ["fantasy", "dream", "like to try", "never tried", "experience"]):
-            if "i've never" in customer_lower or "i want to" in customer_lower:
-                self.logbook.add_entry("Sexual", f"Customer shared: {customer_msg[:100]}", self.customer_profile.get("name"))
-        
-        if any(word in customer_lower for word in ["sick", "surgery", "medical", "health", "migraine", "glasses", "smoke"]):
-            self.logbook.add_entry("Health", f"Customer health info: {customer_msg[:100]}", self.customer_profile.get("name"))
-        
-        if "[Customer shared a photo:" in customer_msg:
-            photo_desc = customer_msg.split("[Customer shared a photo:")[1].split("]")[0]
-            self.logbook.add_entry("Update", f"Photo received: {photo_desc}", self.customer_profile.get("name"))
-            
-    async def _generate_response(self, last_msg: Dict, conversation: List[Dict], is_follow_up: bool = False):
-        """Generate response."""
+                log("INFO", f"Invented profession: {detail}")
+        for p in (r"i am an? ([\w\s]{3,30}?)(?:\.|,|$)", r"i work as an? ([\w\s]{3,30}?)(?:\.|,|$)",
+                  r"my job is ([\w\s]{3,30}?)(?:\.|,|$)", r"i'm an? ([\w\s]{3,30}?)(?:\.|,|$)"):
+            m = re.search(p, low)
+            if m:
+                self.logbook.add_entry("Client_Work", f"Client profession: {m.group(1).strip()}", cust)
+                break
+        if any(w in low for w in ("fantasy", "dream", "like to try", "never tried", "turn me on", "turns me on")):
+            self.logbook.add_entry("Sexual", f"Customer shared: {text[:120]}", cust)
+        if any(w in low for w in ("sick", "surgery", "hospital", "medical", "migraine", "diabetes", "smoke", "injury")):
+            self.logbook.add_entry("Health", f"Customer health: {text[:120]}", cust)
+        if "[Customer shared a photo:" in text:
+            self.logbook.add_entry("Update", f"Photo received: {text.split('[Customer shared a photo:')[1].split(']')[0].strip()}", cust)
+
+    def _build_summary(self) -> str:
+        parts = []
+        for k, label in (("age", "Player age"), ("location", "Player location"), ("hair", "Player hair"),
+                         ("eyes", "Player eyes"), ("body_type", "Player body"), ("about", "Player bio")):
+            if self.player_profile.get(k):
+                parts.append(f"{label}: {self.player_profile[k][:120]}")
+        for k, label in (("age", "Customer age"), ("status", "Customer status"), ("occupation", "Customer job"),
+                         ("about_me", "Customer about"), ("hobbies", "Customer hobbies")):
+            if self.customer_profile.get(k):
+                parts.append(f"{label}: {self.customer_profile[k][:120]}")
+        parts.append(self.logbook.get_summary_for_prompt())
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------ generation
+    def _classify(self, text: str) -> str:
+        t = text.lower()
+        if any(k in t for k in ("sex", "fuck", "cock", "dick", "pussy", "cum", "naked", "nude", "horny", "wet", "hard")):
+            return "sexual"
+        if any(k in t for k in ("sexy", "beautiful", "kiss", "gorgeous", "hot", "cuddle", "date", "miss you")):
+            return "flirty"
+        return "casual"
+
+    async def _generate_reply(self, last_msg: Dict, conversation: List[Dict], is_follow_up: bool = False) -> Optional[str]:
         recent = conversation[-15:]
-        category = self._classify(last_msg["text"]) if not is_follow_up else "casual"
-        
-        if is_follow_up:
-            print("[INFO] Generating follow-up message...")
-        
+        category = "casual" if is_follow_up else self._classify(last_msg["text"])
         system_prompt = build_system_prompt(
             rules=self.rules,
             player_name=self.player_profile.get("name", "Player"),
             player_occupation=self.player_profile.get("occupation", "Worker"),
             player_location=self.player_profile.get("location"),
             customer_name=self.customer_profile.get("name", "Customer"),
-            customer_location=self.customer_profile.get("location", "Unknown"),
+            customer_location=self.customer_profile.get("location", "somewhere nearby"),
             logbook_summary=self._build_summary(),
             category=category,
-            past_replies=[m["text"] for m in recent if m["speaker"] == "player"][-10:],
+            past_replies=[m["text"] for m in recent if m["speaker"] == "player"],
             user_message=last_msg["text"],
-            is_follow_up=is_follow_up
-        )
-        
-        history = [{"role": "user" if m["speaker"] == "customer" else "assistant", "content": m["text"]} 
-                   for m in recent]
-        
-        result = self.deepseek.generate(system_prompt, history, user_message=last_msg["text"], temperature=0.95)
-        
-        if result["ok"]:
-            reply = result["text"]
-            print(f"[INFO] Bot: {reply[:80]}...")
-            await self._type_response(reply)
-            await self._send_response()
-        else:
-            print(f"[ERROR] {result['error']}")
+            is_follow_up=is_follow_up)
+        history = build_history_messages(recent)
+        if not history or history[-1]["role"] != "user":
+            history.append({"role": "user", "content": "(he has not replied yet, send your follow-up)"})
 
-    async def _read_platform_history(self) -> List[Dict]:
-        """Read previous conversation history."""
-        messages = []
-        
-        try:
-            all_bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
-            
-            for bubble in all_bubbles:
-                try:
-                    classes = await bubble.get_attribute("class") or ""
-                    
-                    is_old = any(marker in classes for marker in ["old", "previous", "history", "past", "read-only", "archived"])
-                    
-                    if not is_old:
-                        continue
-                    
-                    text_elem = await bubble.query_selector(".message-content, .text")
-                    text = await text_elem.inner_text() if text_elem else ""
-                    
-                    if "customer" in classes or "client" in classes:
-                        speaker = "customer"
-                    elif "entertainment" in classes or "player" in classes or "operator" in classes:
-                        speaker = "player"
-                    else:
-                        continue
-                    
-                    if text.strip():
-                        messages.append({
-                            "speaker": speaker,
-                            "text": text.strip(),
-                            "is_historical": True
-                        })
-                        
-                except:
-                    continue
-                    
-        except Exception as e:
-            print(f"[WARNING] Failed to read platform history: {e}")
-        
-        if messages:
-            print(f"[INFO] Loaded {len(messages)} messages from platform history")
-            
-        return messages
-    
-    async def _extract_facts_from_history(self, history: List[Dict]):
-        """Scan previous conversation for facts."""
-        player_messages = [m["text"] for m in history if m["speaker"] == "player"]
-        
-        for msg in player_messages:
-            msg_lower = msg.lower()
-            
-            if any(phrase in msg_lower for phrase in ["i am a", "i'm a", "i work as", "my job is"]):
-                patterns = [
-                    r'i am a[n]? ([\w\s]+?)(?:\.|$)',
-                    r'i\'m a[n]? ([\w\s]+?)(?:\.|$)',
-                    r'i work as a[n]? ([\w\s]+?)(?:\.|$)',
-                    r'my job is ([\w\s]+?)(?:\.|$)'
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, msg_lower)
-                    if match:
-                        job = match.group(1).strip()
-                        if not self.logbook.get_player_profession():
-                            self.logbook.set_profession(job, client=self.customer_profile.get("name"))
-                            print(f"[INFO] Extracted profession from history: {job}")
-                        break
-            
-            if "i live in" in msg_lower or "i'm from" in msg_lower or "i am from" in msg_lower:
-                patterns = [
-                    r'i live in ([\w\s,]+?)(?:\.|$)',
-                    r'i\'m from ([\w\s,]+?)(?:\.|$)',
-                    r'i am from ([\w\s,]+?)(?:\.|$)'
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, msg_lower)
-                    if match:
-                        loc = match.group(1).strip()
-                        self.logbook.add_entry("Work", f"Location mentioned: {loc}", self.customer_profile.get("name"))
-                        print(f"[INFO] Extracted location from history: {loc}")
-                        break
+        note = ""
+        for attempt in range(3):
+            result = await asyncio.to_thread(self.deepseek.generate, system_prompt + note, history, None, 0.95 - 0.1 * attempt, 350)
+            if not result["ok"]:
+                log("ERROR", f"DeepSeek: {result['error']}")
+                continue
+            text = normalize_for_typing(self.guard.sanitize(result["text"], self.player_profile.get("name")),
+                                        allow_emoji=bool(self.settings.get("allow_emoji", False)))
+            ok, reason = self.guard.check(text, is_follow_up)
+            if ok:
+                return text
+            log("GUARD", f"Rejected draft ({reason}), regenerating")
+            note = f"\n\nYOUR PREVIOUS DRAFT WAS REJECTED: {reason}. Write a new reply that fixes this."
+        return None
 
-    def _build_summary(self) -> str:
-        """Build summary from profiles + logbook."""
-        parts = []
-        
-        if self.player_profile.get("age"):
-            parts.append(f"Player Age: {self.player_profile['age']}")
-        if self.player_profile.get("occupation"):
-            parts.append(f"Player Work: {self.player_profile['occupation']}")
-        if self.player_profile.get("location"):
-            parts.append(f"Player Location: {self.player_profile['location']}")
-        if self.player_profile.get("about"):
-            parts.append(f"Player Bio: {self.player_profile['about'][:100]}")
-        
-        if self.customer_profile.get("age"):
-            parts.append(f"Customer Age: {self.customer_profile['age']}")
-        if self.customer_profile.get("about_me"):
-            parts.append(f"Customer: {self.customer_profile['about_me'][:80]}")
-        
-        entries = self.logbook.all_entries()[-5:]
-        for e in entries:
-            parts.append(f"[{e['category']}] {e['comment'][:60]}")
-        
-        return "\n".join(parts) if parts else "(No profile data)"
-        
-    async def _read_conversation_history(self) -> List[Dict]:
-        """Read all messages including image detection."""
-        messages = []
-        bubbles = await self.page.query_selector_all(".message-blob, .chat-message")
-        
-        for bubble in bubbles:
-            try:
-                classes = await bubble.get_attribute("class") or ""
-                
-                if "message-customer" in classes or "customer" in classes:
-                    speaker = "customer"
-                elif "message-entertainment" in classes or "entertainment" in classes:
-                    speaker = "player"
-                else:
-                    continue
-                
-                text_elem = await bubble.query_selector(".message-content, .text")
-                text = await text_elem.inner_text() if text_elem else ""
-                
-                image_elem = await bubble.query_selector("img, .message-image, [data-testid='messageImage']")
-                if image_elem and speaker == "customer":
-                    image_url = await image_elem.get_attribute("src")
-                    if image_url:
-                        print(f"[INFO] Customer sent image")
-                        image_desc = await self._analyze_image(image_url)
-                        text += f" [Customer shared a photo: {image_desc}]"
-                
-                if text.strip():
-                    messages.append({"speaker": speaker, "text": text.strip()})
-                    
-            except Exception as e:
-                continue
-        
-        return messages
-    
-    async def _analyze_image(self, image_url: str) -> str:
-        """Analyze image using OpenAI Vision if enabled."""
-        if not self.openai_enabled:
-            return "photo"
-        
-        try:
-            js_code = """
-                async () => {
-                    const res = await fetch("%s");
-                    const blob = await res.blob();
-                    return new Promise((resolve) => {
-                        const reader = new FileReader();
-                        reader.onloadend = () => resolve(reader.result);
-                        reader.readAsDataURL(blob);
-                    });
-                }
-            """ % image_url
-            
-            response = await self.page.evaluate(js_code)
-            
-            if response and ',' in response:
-                base64_data = response.split(',')[1]
-                
-                import openai
-                client = openai.AsyncOpenAI(api_key=self.openai_key)
-                
-                result = await client.chat.completions.create(
-                    model="gpt-4-vision-preview",
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe this image briefly and compliment what you see. If it's a person/selfie/nude, be flattering and appreciative. Keep it under 20 words."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_data}"}}
-                        ]
-                    }],
-                    max_tokens=60
-                )
-                
-                desc = result.choices[0].message.content
-                print(f"[INFO] Image analysis: {desc[:60]}...")
-                return desc
-                
-        except Exception as e:
-            print(f"[WARNING] Image analysis failed: {e}")
-        
-        return "photo"
-    
-    async def _type_response(self, text: str):
-        """Type like a human - slower, irregular, to avoid copy-paste detection."""
-        # Ensure input is visible first (NEW - fixes view issue)
-        await self._ensure_input_visible()
-        
-        # Find input box
-        input_selectors = [
-            "[data-testid='messageTextArea']",
-            ".chat-input",
-            "textarea",
-            "[contenteditable='true']"
-        ]
-        
-        input_box = None
-        for selector in input_selectors:
-            try:
-                input_box = await self.page.query_selector(selector)
-                if input_box:
-                    await input_box.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.5)
-                    await input_box.click()
-                    break
-            except:
-                continue
-        
-        if not input_box:
-            print("[ERROR] Could not find input box")
-            return
-        
-        # Clear existing text naturally
-        await self.page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await self.page.keyboard.press("Delete")
-        await asyncio.sleep(0.3)
-        
-        # TYPE LIKE A HUMAN (fixes copy-paste warning)
-        print(f"[INFO] Typing {len(text)} characters...")
-        
-        words = text.split()
-        for i, word in enumerate(words):
-            # Type each character with human delay (80-250ms)
-            for char in word:
-                delay = random.uniform(80, 250)
-                await self.page.keyboard.type(char, delay=delay)
-                
-                # Occasional longer pause (thinking)
-                if random.random() < 0.05:
-                    await asyncio.sleep(random.uniform(0.3, 0.8))
-            
-            # Space between words
-            if i < len(words) - 1:
-                await self.page.keyboard.type(" ", delay=random.uniform(50, 150))
-                
-                # Occasional pause between words
-                if random.random() < 0.1:
-                    await asyncio.sleep(random.uniform(0.2, 0.5))
-        
-        print("[INFO] Finished typing")
-        
-    async def _send_response(self):
-        if self.dry_run:
-            print("[DRY RUN] Review and press Enter...")
-            input()
-            await self.page.keyboard.press("Control+a")
-            await self.page.keyboard.press("Delete")
-            return
-        
-        # Try multiple send button selectors
-        send_selectors = [
-            "[data-testid='sendChatMessageButton']",
-            ".send-button",
-            "button[type='submit']",
-            "button:has-text('Send')",
-            "button.send"
-        ]
-        
-        sent = False
-        for selector in send_selectors:
-            try:
-                await self.page.click(selector, timeout=2000)
-                sent = True
-                print("[INFO] Sent")
-                break
-            except:
-                continue
-        
-        if not sent:
-            # Fallback: press Enter key
-            await self.page.keyboard.press("Enter")
-            print("[INFO] Sent (using Enter key)")
-        
-        # Scroll after sending
-        await self._scroll_to_bottom()
-        
-    def _classify(self, text: str) -> str:
-        t = text.lower()
-        if any(k in t for k in ["sex", "fuck", "cock", "pussy"]):
-            return "sexual"
-        if any(k in t for k in ["sexy", "beautiful", "kiss"]):
-            return "flirty"
-        return "casual"
-        
-    async def _wait_for_assignment(self) -> bool:
-        try:
-            await self.page.wait_for_selector(".message-blob, .chat-message", timeout=10000)
-            await self._scroll_to_bottom()
-            return True
-        except:
+    async def _send_follow_up(self, conversation: List[Dict]):
+        self._followup_sent = True
+        last_player = next((m["text"] for m in reversed(conversation) if m["speaker"] == "player"), "")
+        category = self._classify(last_player)
+        text = normalize_for_typing(await self.excuse_generator.generate_excuse(category))
+        ok, reason = self.guard.check(text, is_follow_up=True)
+        if not ok:
+            log("GUARD", f"Excuse rejected ({reason}), falling back to model follow-up")
+            text = await self._generate_reply({"text": last_player}, conversation, is_follow_up=True)
+        if text and await self._deliver(text):
+            self._awaiting_since = time.time()
+
+    async def _deliver(self, text: str) -> bool:
+        C = self.sel["chat"]
+        await self._dismiss_dialogs()
+        box = await self._first(C["input"], 5000)
+        if not box:
+            log("ERROR", "Could not find the message input")
+            await self._screenshot("no_input")
             return False
-            
-    async def _wait_for_chat_close(self):
-        for _ in range(60):
-            chat = await self.page.query_selector(".message-blob")
-            if not chat:
-                return True
-            await asyncio.sleep(1)
+        await box.scroll_into_view_if_needed()
+        await box.click()
+        await asyncio.sleep(self.timer.between_actions())
+
+        # Clear without Ctrl+A (anti-paste scripts often watch keyboard shortcuts). Usually empty anyway.
+        existing = await box.evaluate("el => el.value !== undefined ? el.value : el.innerText") or ""
+        if existing.strip():
+            await self.page.keyboard.press("End")
+            for _ in range(len(existing) + 2):
+                await self.page.keyboard.press("Backspace")
+
+        log("INFO", f"Typing {len(text)} chars (~{self.typer.estimate_seconds(text):.0f}s): {text[:70]}...")
+        await self.typer.type(text)
+
+        if await self._paste_warning_visible():
+            log("WARNING", "Platform showed a copy/paste warning while typing")
+            await self._screenshot("paste_warning")
+            self._notify("paste", "ChatHomeBase flagged copy/paste while the bot was typing. See logs/screens.")
+
+        if self.dry_run:
+            await asyncio.to_thread(input, "[DRY RUN] Message typed, NOT sent. Press Enter to clear it and continue... ")
+            await box.fill("")
+            return False
+
+        await asyncio.sleep(self.timer.between_actions())
+        if not await self._click_first(C["send"], 3000):
+            await self.page.keyboard.press("Enter")
+        await asyncio.sleep(1.2)
+        remaining = await box.evaluate("el => el.value !== undefined ? el.value : el.innerText") or ""
+        if remaining.strip() and remaining.strip()[:30] == text[:30]:
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(1.0)
+        log("INFO", "Sent")
         return True
-        
-    async def _check_balance(self):
-        balance = self.deepseek.check_balance()
-        print(f"[INFO] DeepSeek balance: ${balance:.2f}")
-        
-        if balance < 4.0 and self.telegram_enabled and self.notifier:
+
+    async def _paste_warning_visible(self) -> bool:
+        C = self.sel["chat"]
+        words = [w.lower() for w in C.get("paste_warning_text", ["paste", "copy"])]
+        for s in C.get("paste_warning", []):
             try:
-                self.notifier.notify_low_balance(self.telegram_user_id, balance, 4.0)
-            except Exception as e:
-                print(f"[WARNING] Failed to send Telegram: {e}")
-        
-    async def _login(self):
-        """Login to chathomebase."""
-        print("[INFO] Logging in...")
-        
+                for el in await self.page.query_selector_all(s):
+                    if await el.is_visible():
+                        t = (await el.inner_text()).lower()
+                        if any(w in t for w in words):
+                            return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    # ------------------------------------------------------------------ inspection
+    async def _dump_dom_hints(self, tag: str):
         try:
-            await self.page.goto("https://chathomebase.com/login")
-            
-            await self.page.fill("input[name='email']", self.settings["chathomebase_login"])
-            await self.page.fill("input[name='password']", self.settings["chathomebase_password"])
-            
-            await self.page.click("[data-testid='signInButton']")
-            
-            await self.page.wait_for_url("**/chat/lobby", timeout=30000)
-            
-            print("[INFO] Successfully logged in")
-            
-        except Exception as e:
-            current_url = self.page.url
-            print(f"[ERROR] Login failed. Current URL: {current_url}")
-            print(f"[ERROR] Timeout waiting for /chat/lobby: {e}")
-            raise
-        
-        for _ in range(5):
-            try:
-                await self.page.click("[data-testid='announcementsDialogNextButton']", timeout=2000)
-                await asyncio.sleep(0.5)
-            except:
-                break
-        try:
-            await self.page.click("[data-testid='announcementsDialogContinueButton']", timeout=2000)
-        except:
-            pass
-            
-        print("[INFO] Ready for assignments")
-        return True
-        
-    async def stop(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+            data = await self.page.evaluate("""() => {
+              const testids = [...document.querySelectorAll('[data-testid]')]
+                .map(e => e.tagName.toLowerCase() + '[data-testid="' + e.dataset.testid + '"]');
+              const classes = new Set();
+              document.querySelectorAll('[class]').forEach(e => {
+                const c = e.className;
+                if (typeof c === "string" && /message|chat|profile|sidebar|customer|entertainment|player|input|send|warn|alert|toast/i.test(c))
+                  classes.add(e.tagName.toLowerCase() + '.' + c.trim().split(/\\s+/).join('.'));
+              });
+              return { url: location.href, testids: [...new Set(testids)], classes: [...classes] };
+            }""")
+            d = LOG_DIR / "inspection"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.txt"
+            path.write_text(f"URL: {data['url']}\n\nDATA-TESTIDS:\n" + "\n".join(data["testids"]) +
+                            "\n\nRELEVANT CLASSES:\n" + "\n".join(sorted(data["classes"])), encoding="utf-8")
+            log("INFO", f"DOM hints written to logs/inspection/{path.name}")
+        except Exception as e:  # noqa: BLE001
+            log("WARNING", f"DOM dump failed: {e}")
+
+    async def _inspection_session(self):
+        await self._dump_dom_hints("lobby")
+        print("\n" + "-" * 60)
+        print("INSPECTION MODE")
+        print(" - Playwright Inspector is open. Use 'Pick locator' to grab selectors.")
+        print(" - Everything the page does with paste/input/key events is printed here as [PAGE] lines.")
+        print(" - Open a chat, then press Resume (play button) in the Inspector to continue.")
+        print("-" * 60 + "\n")
+        await self.page.pause()
+        await self._dump_dom_hints("chat")
+        answer = await asyncio.to_thread(input, "Run a typing test into the chat input now? (y/n): ")
+        if answer.strip().lower().startswith("y"):
+            box = await self._first(self.sel["chat"]["input"], 5000)
+            if not box:
+                log("ERROR", "No input found with current selectors, update data/selectors.json")
+                return
+            await box.click()
+            await self.typer.type("just testing how this feels, ignore me. what are you up to tonight?")
+            await asyncio.sleep(1.5)
+            flagged = await self._paste_warning_visible()
+            log("INFO", f"Typing test finished. Paste warning visible: {flagged}")
+            if flagged:
+                await self._screenshot("inspect_paste_warning")
+            await asyncio.to_thread(input, "Look at the [PAGE] lines above. Press Enter to clear the box and continue in dry-run... ")
+            await box.fill("")
 
 
-async def run_web_bot(settings: dict, dry_run: bool = False):
-    adapter = ChatHomeBaseAdapter(settings, dry_run=dry_run)
+async def run_web_bot(settings: dict, dry_run: bool = False, inspect: bool = False):
+    adapter = ChatHomeBaseAdapter(settings, dry_run=dry_run, inspect=inspect)
     try:
         await adapter.start()
     except KeyboardInterrupt:

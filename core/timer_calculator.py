@@ -1,18 +1,12 @@
-"""Timer utilities for response timing."""
+"""Human-ish delays."""
 
 import random
 
 
 class TimerCalculator:
-    """Calculate appropriate response delays."""
-    
-    def __init__(self):
-        self.base_typing_speed = 0.05  # seconds per character
-    
-    def calculate_typing_delay(self, text_length: int) -> float:
-        """Calculate realistic typing time."""
-        return text_length * self.base_typing_speed + random.uniform(0.5, 1.5)
-    
-    def get_response_delay(self) -> float:
-        """Get random delay before responding."""
-        return random.uniform(1.0, 3.0)
+    def reading_delay(self, incoming_chars: int) -> float:
+        """Time a person needs to read the message and decide what to say."""
+        return min(25.0, random.uniform(2.5, 6.0) + incoming_chars * random.uniform(0.02, 0.04))
+
+    def between_actions(self) -> float:
+        return random.uniform(0.4, 1.2)

@@ -1,6 +1,8 @@
 [
   "phone number",
+  "my number",
   "email me",
+  "my email",
   "text me",
   "outside this platform",
   "real name",
@@ -14,5 +16,7 @@
   "telegram",
   "kik",
   "skype",
-  "discord"
+  "discord",
+  "signal",
+  "onlyfans"
 ]

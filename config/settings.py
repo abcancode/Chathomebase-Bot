@@ -1,4 +1,4 @@
-"""Settings management."""
+"""Settings management. Google key lives in config/google_key.txt (shared, not in settings.json)."""
 
 import json
 from pathlib import Path
@@ -17,18 +17,14 @@ def _save_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def load_settings(config_file: Path) -> dict:
-    """Load settings with shared Google key."""
     settings = _load_json(config_file) if config_file.exists() else {}
-    
-    # Load shared Google key from separate file
     google_key_file = config_file.parent / "google_key.txt"
     if google_key_file.exists():
-        settings["google_api_key"] = google_key_file.read_text().strip()
-    
+        key = google_key_file.read_text(encoding="utf-8").strip()
+        if key:
+            settings["google_api_key"] = key
     return settings
 
 
 def save_settings(config_file: Path, settings: dict) -> None:
-    """Save settings (without Google key - that's in separate file)."""
-    settings_to_save = {k: v for k, v in settings.items() if k != "google_api_key"}
-    _save_json(config_file, settings_to_save)
+    _save_json(config_file, {k: v for k, v in settings.items() if k != "google_api_key"})
