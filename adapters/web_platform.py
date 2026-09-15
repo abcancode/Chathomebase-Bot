@@ -116,6 +116,17 @@ class ChatHomeBaseAdapter:
         self._image_cache: Dict[str, str] = {}
         self._max_cache_size = 100  # Limit cache size to prevent memory issues
 
+    async def _check_balance(self):
+        """Check DeepSeek API balance and notify if below threshold."""
+        try:
+            balance = await asyncio.to_thread(self.deepseek.check_balance)
+            log("INFO", f"DeepSeek balance: ${balance:.2f}")
+            threshold = self.settings.get("deepseek_low_balance_threshold_usd", 4.0)
+            if balance < threshold and self.notifier:
+                self.notifier.notify_low_balance(self.settings["telegram_user_id"], balance, threshold)
+        except Exception as e:
+            log("WARNING", f"Could not check balance: {e}")
+
     # ------------------------------------------------------------------ lifecycle
     async def start(self):
         mode = "INSPECT" if self.inspect else ("DRY RUN" if self.dry_run else "LIVE")
@@ -193,58 +204,71 @@ class ChatHomeBaseAdapter:
 
     async def _dismiss_dialogs(self):
         L, C = self.sel["login"], self.sel["chat"]
+        log("INFO", "Checking for announcement dialogs...")
+        
+        # 1. Try to click the Announcements button (if it's there)
+        # We use a generic click command that won't crash if missing
+        try:
+            await self._click_first(L.get("announcement_button", []), 2000)
+            log("INFO", "Clicked Announcements button (if visible)")
+            await asyncio.sleep(1.5)  # Wait for modal animation
+        except Exception:
+            pass
+        
+        # 2. Force the Next button
+        log("INFO", "Attempting to click Next buttons...")
         for _ in range(5):
-            if not await self._click_first(L["announcement_next"], 400):
+            if not await self._click_enabled_button(L["announcement_next"], 2000):
                 break
             await asyncio.sleep(0.4)
-        await self._click_first(L["announcement_continue"], 400)
-        if await self._click_first(C["close_banner"], 300):
+        
+        # 3. Click Continue button
+        await self._click_enabled_button(L["announcement_continue"], 2000)
+        
+        # 4. Try to close any banners
+        if await self._click_enabled_button(C["close_banner"], 1500):
             log("INFO", "Closed a banner")
-
-    async def _screenshot(self, tag: str):
-        try:
-            d = LOG_DIR / "screens"
-            d.mkdir(parents=True, exist_ok=True)
-            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.png"
-            await self.page.screenshot(path=str(path), full_page=False)
-            log("INFO", f"Screenshot: {path.name}")
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _notify(self, key: str, text: str, cooldown: int = 1800):
-        if not self.notifier:
-            return
-        if time.time() - self._notified.get(key, 0) < cooldown:
-            return
-        self._notified[key] = time.time()
-        self.notifier.send(self.settings["telegram_user_id"], text)
-
-    async def _check_balance(self):
-        balance = await asyncio.to_thread(self.deepseek.check_balance)
-        log("INFO", f"DeepSeek balance: ${balance:.2f}")
-        threshold = self.settings.get("deepseek_low_balance_threshold_usd", 4.0)
-        if balance < threshold and self.notifier:
-            self.notifier.notify_low_balance(self.settings["telegram_user_id"], balance, threshold)
-
+    
+    async def _click_enabled_button(self, selectors: List[str], timeout_ms: int = 1500):
+        """Click a button only when it's enabled (not disabled)."""
+        deadline = time.time() + timeout_ms / 1000
+        while time.time() < deadline:
+            for s in selectors:
+                try:
+                    btn = self.page.locator(s).first
+                    if await btn.count() > 0:
+                        # Wait for button to be visible
+                        try:
+                            await btn.wait_for(state='visible', timeout=500)
+                        except:
+                            continue
+                        
+                        # Check if enabled
+                        is_enabled = await btn.is_enabled()
+                        if is_enabled:
+                            await btn.click(timeout=1000)
+                            log("INFO", f"Clicked button: {s}")
+                            return True
+                except Exception:
+                    continue
+            await asyncio.sleep(0.2)
+        return False
+    
     # ------------------------------------------------------------------ login
     async def _login(self) -> bool:
         L = self.sel["login"]
         log("INFO", "Checking session...")
         
-        # FORCE BROWSER TO FRONT TO SEE WHAT'S HAPPENING
         await self.page.bring_to_front()
         await asyncio.sleep(1.0)
         
-        # CHECK 1: Are we on the Lobby? (Definitive logged in)
         if "lobby" in self.page.url:
             log("INFO", "Found lobby URL - already logged in")
             await self._dismiss_dialogs()
             return True
             
-        # CHECK 2: Are we on a chat page with your username?
         if "/chat/" in self.page.url and "login" not in self.page.url:
             try:
-                # Look for any chat interface elements
                 chat_elements = await self.page.query_selector_all(
                     ".message-blob, .chat-message, .customer-profile, [class*='profile']"
                 )
@@ -255,17 +279,15 @@ class ChatHomeBaseAdapter:
             except:
                 pass
             
-            # CHECK 3: Look for your specific username
             try:
                 body_text = await self.page.inner_text("body")
-                if "USETN4650774" in body_text:  # Your username
+                if "USETN4650774" in body_text:
                     log("INFO", "Found your username in page - already logged in")
                     await self._dismiss_dialogs()
                     return True
             except:
                 pass
             
-            # CHECK 4: Look for a logout button
             try:
                 logout = await self.page.query_selector(
                     "button:has-text('Logout'), button:has-text('Sign out'), [data-testid='logoutButton']"
@@ -277,38 +299,59 @@ class ChatHomeBaseAdapter:
             except:
                 pass
 
-        # If we are here, we are DEFINITELY not logged in. Proceed with login.
         log("INFO", "Not logged in. Navigating to login page...")
-        
-        # Make sure browser is visible
         await self.page.bring_to_front()
         await asyncio.sleep(1.5)
         
         await self.page.goto(L["url"], wait_until="domcontentloaded")
-        await asyncio.sleep(2.0)  # Wait to see the login page
+        log("INFO", "Navigated to login URL")
+        await asyncio.sleep(2.0)
         
-        # Human-like delays between actions
         await asyncio.sleep(random.uniform(1.0, 2.0))
         
+        log("INFO", "Waiting for login form...")
         email = await self._first(L["email"], 10000)
-        password = await self._first(L["password"], 3000)
-        if not email or not password:
+        if not email:
             raise RuntimeError(f"Login form not found at {self.page.url}")
             
         await email.click()
+        log("INFO", "Typing email...")
         await self.typer.type(self.settings["chathomebase_login"], typos=False)
         await asyncio.sleep(random.uniform(0.5, 1.0))
         
+        password = await self._first(L["password"], 3000)
+        if not password:
+            raise RuntimeError(f"Password input not found at {self.page.url}")
+            
         await password.click()
+        log("INFO", "Typing password...")
         await self.typer.type(self.settings["chathomebase_password"], typos=False)
         await asyncio.sleep(random.uniform(0.5, 1.0))
         
+        log("INFO", "Submitting login form...")
         if not await self._click_first(L["submit"], 2000):
+            log("INFO", "Submit button not found, pressing Enter...")
             await self.page.keyboard.press("Enter")
             
+        log("INFO", "Waiting for lobby URL...")
         await self.page.wait_for_url(L["lobby_url_glob"], timeout=30000)
-        log("INFO", "Successfully logged in")
-        await self._dismiss_dialogs()
+        log("INFO", "Successfully logged in. Lobby reached.")
+        
+        # WAIT FOR ANNOUNCEMENTS TO RENDER
+        # Sometimes the modal pops up 1-2 seconds after the URL changes
+        await asyncio.sleep(2.0)
+        
+        announcements = await self._dismiss_dialogs()
+        
+        if announcements:
+            log("INFO", "------------------------------------------------------------")
+            log("INFO", "ANNOUNCEMENT CONTENT:")
+            for text in announcements:
+                log("INFO", text)
+            log("INFO", "------------------------------------------------------------")
+        else:
+            log("INFO", "No announcements found or already dismissed.")
+            
         return True
     
     # ------------------------------------------------------------------ main loop

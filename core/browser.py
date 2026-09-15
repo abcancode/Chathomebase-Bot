@@ -1,9 +1,3 @@
-"""Browser launcher: small fixed window for inspection, maximised for live use.
-
-Uses a persistent profile (login cookies survive restarts) and drops the
-fingerprint red flags the old version shipped with.
-"""
-
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -11,6 +5,7 @@ from playwright.async_api import async_playwright, BrowserContext, Page, Playwri
 
 INSPECT_SIZE = (1280, 720)
 
+# For Windows: NO sandbox flags (they cause the warning on Windows)
 BASE_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
@@ -22,7 +17,6 @@ BASE_ARGS = [
     "--disable-features=VizDisplayCompositor",
     "--disable-ipc-flooding-protection",
     "--disable-dev-shm-usage",
-    # REMOVED: No sandbox flags to eliminate warnings
     "--disable-webgl",
     "--disable-webrtc",
     "--disable-audio-api",
@@ -98,10 +92,9 @@ async def launch_browser(
     channel: Optional[str] = None,
     user_agent: Optional[str] = None,
 ) -> Tuple[Playwright, BrowserContext, Page]:
-    """Returns (playwright, context, page). Inspect = 1280x720 window; live = maximised, real screen viewport."""
     pw = await async_playwright().start()
     kwargs = dict(
-        headless=False,  # CRITICAL: Must be False to see the browser
+        headless=False,
         proxy=proxy_config,
         ignore_default_args=["--enable-automation"],
         locale="en-US",
@@ -113,12 +106,12 @@ async def launch_browser(
         kwargs["viewport"] = {"width": w, "height": h}
     else:
         kwargs["args"] = BASE_ARGS + ["--start-maximized"]
-        kwargs["no_viewport"] = True  # let the page use the real window size
+        kwargs["no_viewport"] = True
         
     if user_agent:
         kwargs["user_agent"] = user_agent
 
-    # CRITICAL: Use your actual Chrome profile path
+    # Use your actual Chrome profile
     actual_profile = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Default"
     
     if not actual_profile.exists():
@@ -129,15 +122,16 @@ async def launch_browser(
     user_data_dir = actual_profile
     
     print(f"[INFO] Using Chrome profile: {user_data_dir}")
+    print(f"[INFO] Sandbox flags: OFF (Windows mode)")
     
     user_data_dir.mkdir(parents=True, exist_ok=True)
     context = None
-    for ch in ([channel] if channel else ["chrome", None]):  # real Chrome first, bundled Chromium as fallback
+    for ch in ([channel] if channel else ["chrome", None]):
         try:
             context = await pw.chromium.launch_persistent_context(str(user_data_dir), channel=ch, **kwargs)
             print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1280x720' if inspect else 'maximised'})")
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[WARNING] Could not launch {ch or 'bundled chromium'}: {str(e).splitlines()[0]}")
     if context is None:
         await pw.stop()
@@ -146,7 +140,6 @@ async def launch_browser(
     await context.add_init_script(STEALTH_JS)
     page = context.pages[0] if context.pages else await context.new_page()
     
-    # CRITICAL: Force the browser to be visible
     await page.bring_to_front()
     
     return pw, context, page

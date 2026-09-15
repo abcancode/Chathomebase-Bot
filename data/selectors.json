@@ -1,5 +1,5 @@
 {
-  "_comment": "Edit after running INSPECT. First matching selector in each list wins. Verify close_banner does NOT match the button that closes the chat itself.",
+  "_comment": "Edit after running INSPECT. First matching selector in each list wins.",
   "login": {
     "url": "https://chathomebase.com/login",
     "lobby_url": "https://chathomebase.com/chat/lobby",
@@ -7,9 +7,18 @@
     "email": ["input[name='email']", "input[type='email']"],
     "password": ["input[name='password']", "input[type='password']"],
     "submit": ["[data-testid='signInButton']", "button[type='submit']"],
-    "announcement_next": ["[data-testid='announcementsDialogNextButton']"],
+    "announcement_button": ["[data-testid='announcementsButton']"],
+    "announcement_next": [
+      "[data-testid='announcementsDialogNextButton']",
+      "button:has-text('NEXT')",
+      "button:has-text('Next')",
+      "[class*='next']",
+      "button[class*='Next']"
+    ],
     "announcement_continue": [
-      "[data-testid='announcementsDialogContinueButton']"
+      "[data-testid='announcementsDialogContinueButton']",
+      "button:has-text('CONTINUE')",
+      "button:has-text('Continue')"
     ]
   },
   "chat": {
