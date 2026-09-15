@@ -255,7 +255,7 @@ class ChatHomeBaseAdapter:
             except:
                 pass
             
-            # CHECK 3: Look for your specific username in the page text
+            # CHECK 3: Look for your specific username
             try:
                 body_text = await self.page.inner_text("body")
                 if "USETN4650774" in body_text:  # Your username
