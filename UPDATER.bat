@@ -25,7 +25,7 @@ if %errorlevel% neq 0 (
 :: IMPORTANT: UPDATE THESE TO YOUR REPO URL
 :: Replace with the actual GitHub repository URL where you host the bot
 :: ==========================================
-set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
+set VERSION_URL=https://raw.githubusercontent.com/https://github.com/abcancode/Chathomebase-Bot/blob/main/version.txt
 set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.0.0/latest.zip
 :: ==========================================
 
