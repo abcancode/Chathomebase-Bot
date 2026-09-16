@@ -47,7 +47,7 @@ INSPECTOR_JS = r"""
     let s = t.tagName.toLowerCase();
     if (t.id) s += '#' + t.id;
     if (t.dataset && t.dataset.testid) s += '[data-testid=' + t.dataset.testid + ']';
-    if (typeof t.className === 'string' && t.className) s += '.' + t.className.trim().split(/\s+/).slice(0, 3).join('.');
+    if (typeof t.className === 'string' && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
     return s;
   };
   const watched = ['paste', 'copy', 'cut', 'beforeinput', 'input', 'keydown', 'keypress', 'keyup', 'drop', 'compositionstart'];
@@ -91,6 +91,7 @@ async def launch_browser(
     inspect: bool = False,
     channel: Optional[str] = None,
     user_agent: Optional[str] = None,
+    profile_name: Optional[str] = None,
 ) -> Tuple[Playwright, BrowserContext, Page]:
     pw = await async_playwright().start()
     kwargs = dict(
@@ -111,24 +112,29 @@ async def launch_browser(
     if user_agent:
         kwargs["user_agent"] = user_agent
 
-    # Use your actual Chrome profile
+    # USE UNIQUE PROFILE NAME IF PROVIDED
+    final_profile_dir = user_data_dir
+    if profile_name:
+        final_profile_dir = user_data_dir / profile_name
+    
+    # Use your actual Chrome profile OR the unique folder
     actual_profile = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Default"
     
     if not actual_profile.exists():
         print(f"[WARNING] Chrome profile not found at {actual_profile}")
-        print(f"Using fallback profile: {user_data_dir}")
-        actual_profile = user_data_dir
+        print(f"Using fallback profile: {final_profile_dir}")
+        actual_profile = final_profile_dir
     
-    user_data_dir = actual_profile
+    final_profile_dir = actual_profile
     
-    print(f"[INFO] Using Chrome profile: {user_data_dir}")
+    print(f"[INFO] Using Chrome profile: {final_profile_dir}")
     print(f"[INFO] Sandbox flags: OFF (Windows mode)")
     
-    user_data_dir.mkdir(parents=True, exist_ok=True)
+    final_profile_dir.mkdir(parents=True, exist_ok=True)
     context = None
     for ch in ([channel] if channel else ["chrome", None]):
         try:
-            context = await pw.chromium.launch_persistent_context(str(user_data_dir), channel=ch, **kwargs)
+            context = await pw.chromium.launch_persistent_context(str(final_profile_dir), channel=ch, **kwargs)
             print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1280x720' if inspect else 'maximised'})")
             break
         except Exception as e:

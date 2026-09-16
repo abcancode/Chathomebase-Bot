@@ -132,9 +132,13 @@ class ChatHomeBaseAdapter:
         mode = "INSPECT" if self.inspect else ("DRY RUN" if self.dry_run else "LIVE")
         print(f"\n{'=' * 60}\nChatHomeBase Bot   Mode: {mode}\n{'=' * 60}\n")
 
+        # PASS PROFILE NAME HERE TO CREATE UNIQUE WINDOW
+        profile_name = self.settings.get("chrome_profile_folder", "Default")
+        
         self.playwright, self.context, self.page = await launch_browser(
             ROOT / "profile", self.proxy_config, inspect=self.inspect,
-            channel=self.settings.get("browser_channel"), user_agent=self.settings.get("user_agent"))
+            channel=self.settings.get("browser_channel"), user_agent=self.settings.get("user_agent"),
+            profile_name=profile_name)
         self.typer = HumanTyper(self.page,
                                 (self.settings.get("typing_cpm_min", 190), self.settings.get("typing_cpm_max", 260)))
         if self.inspect:
@@ -207,7 +211,6 @@ class ChatHomeBaseAdapter:
         log("INFO", "Checking for announcement dialogs...")
         
         # 1. Try to click the Announcements button (if it's there)
-        # We use a generic click command that won't crash if missing
         try:
             await self._click_first(L.get("announcement_button", []), 2000)
             log("INFO", "Clicked Announcements button (if visible)")
@@ -338,7 +341,6 @@ class ChatHomeBaseAdapter:
         log("INFO", "Successfully logged in. Lobby reached.")
         
         # WAIT FOR ANNOUNCEMENTS TO RENDER
-        # Sometimes the modal pops up 1-2 seconds after the URL changes
         await asyncio.sleep(2.0)
         
         announcements = await self._dismiss_dialogs()
@@ -560,6 +562,17 @@ class ChatHomeBaseAdapter:
             del self._image_cache[oldest_key]
             
         return desc
+
+    # ------------------------------------------------------------------ screenshot
+    async def _screenshot(self, tag: str):
+        try:
+            d = LOG_DIR / "screens"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.png"
+            await self.page.screenshot(path=str(path), full_page=False)
+            log("INFO", f"Screenshot: {path.name}")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ memory
     def _extract_facts_from_history(self, history: List[Dict]):
