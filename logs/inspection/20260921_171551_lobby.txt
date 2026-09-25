@@ -1,0 +1,25 @@
+URL: https://chathomebase.com/chat/claimed
+
+DATA-TESTIDS:
+header[data-testid="chatHomeBaseBar"]
+a[data-testid="chatButton"]
+a[data-testid="pokeButton"]
+a[data-testid="abuseButton"]
+a[data-testid="announcementsButton"]
+a[data-testid="statisticsButton"]
+a[data-testid="queueInsightsButton"]
+a[data-testid="connectedOperatorsButton"]
+a[data-testid="triggerButton"]
+a[data-testid="debugButton"]
+button[data-testid="announcementsButton"]
+button[data-testid="userProfileButton"]
+div[data-testid="user-info"]
+span[data-testid="usernameText"]
+span[data-testid="tenantId"]
+div[data-testid="claimLoaderContainer"]
+a[data-testid="myStatsButton"]
+a[data-testid="settingsButton"]
+div[data-testid="logOutButton"]
+
+RELEVANT CLASSES:
+i.mdi-message-settings-outline.mdi.v-icon.notranslate.v-theme--light.v-icon--size-default

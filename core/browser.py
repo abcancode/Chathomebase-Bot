@@ -112,17 +112,18 @@ async def launch_browser(
     if user_agent:
         kwargs["user_agent"] = user_agent
 
-    # USE UNIQUE PROFILE NAME IF PROVIDED
+    # HANDLE PROFILE NAME
     final_profile_dir = user_data_dir
     if profile_name:
         final_profile_dir = user_data_dir / profile_name
+        print(f"[INFO] Using custom profile directory: {final_profile_dir}")
     
     # Use your actual Chrome profile OR the unique folder
     actual_profile = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Default"
     
     if not actual_profile.exists():
         print(f"[WARNING] Chrome profile not found at {actual_profile}")
-        print(f"Using fallback profile: {final_profile_dir}")
+        print(f"[WARNING] Using fallback profile: {final_profile_dir}")
         actual_profile = final_profile_dir
     
     final_profile_dir = actual_profile

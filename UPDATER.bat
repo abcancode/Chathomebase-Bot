@@ -26,7 +26,7 @@ if %errorlevel% neq 0 (
 set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
 
 :: Example: https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0.0/latest.zip
-set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.8/latest.zip
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.7/latest.zip
 :: ==========================================
 
 echo Checking for updates...

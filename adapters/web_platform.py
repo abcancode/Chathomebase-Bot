@@ -114,7 +114,7 @@ class ChatHomeBaseAdapter:
         self._awaiting_since: Optional[float] = None
         self._followup_sent = False
         self._image_cache: Dict[str, str] = {}
-        self._max_cache_size = 100  # Limit cache size to prevent memory issues
+        self._max_cache_size = 100
 
     async def _check_balance(self):
         """Check DeepSeek API balance and notify if below threshold."""
@@ -127,12 +127,10 @@ class ChatHomeBaseAdapter:
         except Exception as e:
             log("WARNING", f"Could not check balance: {e}")
 
-    # ------------------------------------------------------------------ lifecycle
     async def start(self):
         mode = "INSPECT" if self.inspect else ("DRY RUN" if self.dry_run else "LIVE")
         print(f"\n{'=' * 60}\nChatHomeBase Bot   Mode: {mode}\n{'=' * 60}\n")
 
-        # PASS PROFILE NAME HERE TO CREATE UNIQUE WINDOW
         profile_name = self.settings.get("chrome_profile_folder", "Default")
         
         self.playwright, self.context, self.page = await launch_browser(
@@ -183,7 +181,7 @@ class ChatHomeBaseAdapter:
                     loc = self.page.locator(s).first
                     if await loc.count() and await loc.is_visible():
                         return loc
-                except Exception:  # noqa: BLE001
+                except Exception:
                     continue
             if time.time() >= deadline:
                 return None
@@ -193,7 +191,7 @@ class ChatHomeBaseAdapter:
         loc = await self._first(selectors, timeout_ms)
         try:
             return (await loc.inner_text()) if loc else ""
-        except Exception:  # noqa: BLE001
+        except Exception:
             return ""
 
     async def _click_first(self, selectors: List[str], timeout_ms: int = 1500) -> bool:
@@ -203,50 +201,51 @@ class ChatHomeBaseAdapter:
         try:
             await loc.click(timeout=2000)
             return True
-        except Exception:  # noqa: BLE001
+        except Exception:
             return False
 
     async def _dismiss_dialogs(self):
         L, C = self.sel["login"], self.sel["chat"]
         log("INFO", "Checking for announcement dialogs...")
-        
-        # 1. Try to click the Announcements button (if it's there)
+
         try:
             await self._click_first(L.get("announcement_button", []), 2000)
             log("INFO", "Clicked Announcements button (if visible)")
-            await asyncio.sleep(1.5)  # Wait for modal animation
+            await asyncio.sleep(1.5)
         except Exception:
             pass
         
-        # 2. Force the Next button
-        log("INFO", "Attempting to click Next buttons...")
         for _ in range(5):
             if not await self._click_enabled_button(L["announcement_next"], 2000):
                 break
             await asyncio.sleep(0.4)
         
-        # 3. Click Continue button
         await self._click_enabled_button(L["announcement_continue"], 2000)
         
-        # 4. Try to close any banners
+        # Check for and close a generic chat overlay/sandbox
+        try:
+            overlay = self.page.locator("div[class*='modal'], div[class*='overlay'], div[id*='modal'], div[id*='overlay']").first
+            if await overlay.count() > 0:
+                log("INFO", "Found Overlay/Sandbox, clicking to dismiss...")
+                await overlay.click(timeout=2000)
+                await asyncio.sleep(1.0)
+        except Exception:
+            pass
+        
         if await self._click_enabled_button(C["close_banner"], 1500):
             log("INFO", "Closed a banner")
     
     async def _click_enabled_button(self, selectors: List[str], timeout_ms: int = 1500):
-        """Click a button only when it's enabled (not disabled)."""
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
             for s in selectors:
                 try:
                     btn = self.page.locator(s).first
                     if await btn.count() > 0:
-                        # Wait for button to be visible
                         try:
                             await btn.wait_for(state='visible', timeout=500)
                         except:
                             continue
-                        
-                        # Check if enabled
                         is_enabled = await btn.is_enabled()
                         if is_enabled:
                             await btn.click(timeout=1000)
@@ -265,56 +264,61 @@ class ChatHomeBaseAdapter:
         await self.page.bring_to_front()
         await asyncio.sleep(1.0)
         
-        if "lobby" in self.page.url:
-            log("INFO", "Found lobby URL - already logged in")
+        if "lobby" in self.page.url or "/chat/" in self.page.url:
+            log("INFO", "Found chat URL - already logged in")
             await self._dismiss_dialogs()
             return True
             
-        if "/chat/" in self.page.url and "login" not in self.page.url:
-            try:
-                chat_elements = await self.page.query_selector_all(
-                    ".message-blob, .chat-message, .customer-profile, [class*='profile']"
-                )
-                if chat_elements:
-                    log("INFO", "Found chat elements - already logged in")
-                    await self._dismiss_dialogs()
-                    return True
-            except:
-                pass
+        if "login" in self.page.url:
+            log("INFO", "On login page. Waiting for form...")
+            await asyncio.sleep(2.0)
             
-            try:
-                body_text = await self.page.inner_text("body")
-                if "USETN4650774" in body_text:
-                    log("INFO", "Found your username in page - already logged in")
-                    await self._dismiss_dialogs()
-                    return True
-            except:
-                pass
+            log("INFO", "Waiting for login form...")
+            email = await self._first(L["email"], 10000)
+            if not email:
+                await self._screenshot("login_form_missing")
+                raise RuntimeError(f"Login form not found at {self.page.url}")
+                
+            await email.click()
+            log("INFO", "Typing email...")
+            await self.typer.type(self.settings["chathomebase_login"], typos=False)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
             
-            try:
-                logout = await self.page.query_selector(
-                    "button:has-text('Logout'), button:has-text('Sign out'), [data-testid='logoutButton']"
-                )
-                if logout:
-                    log("INFO", "Found logout button - already logged in")
-                    await self._dismiss_dialogs()
-                    return True
-            except:
-                pass
-
-        log("INFO", "Not logged in. Navigating to login page...")
+            password = await self._first(L["password"], 3000)
+            if not password:
+                await self._screenshot("password_missing")
+                raise RuntimeError(f"Password input not found at {self.page.url}")
+                
+            await password.click()
+            log("INFO", "Typing password...")
+            await self.typer.type(self.settings["chathomebase_password"], typos=False)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            
+            log("INFO", "Submitting login form...")
+            if not await self._click_first(L["submit"], 2000):
+                log("INFO", "Submit button not found, pressing Enter...")
+                await self.page.keyboard.press("Enter")
+                
+            log("INFO", "Waiting for lobby URL...")
+            await self.page.wait_for_url(L["lobby_url_glob"], timeout=30000)
+            log("INFO", "Successfully logged in. Lobby reached.")
+            
+            await asyncio.sleep(2.0)
+            await self._dismiss_dialogs()
+            return True
+            
+        log("INFO", "Not on login page. Navigating to login page...")
         await self.page.bring_to_front()
         await asyncio.sleep(1.5)
         
-        await self.page.goto(L["url"], wait_until="domcontentloaded")
+        await self.page.goto(L["url"], wait_until="networkidle")
         log("INFO", "Navigated to login URL")
         await asyncio.sleep(2.0)
-        
-        await asyncio.sleep(random.uniform(1.0, 2.0))
         
         log("INFO", "Waiting for login form...")
         email = await self._first(L["email"], 10000)
         if not email:
+            await self._screenshot("login_form_missing")
             raise RuntimeError(f"Login form not found at {self.page.url}")
             
         await email.click()
@@ -324,6 +328,7 @@ class ChatHomeBaseAdapter:
         
         password = await self._first(L["password"], 3000)
         if not password:
+            await self._screenshot("password_missing")
             raise RuntimeError(f"Password input not found at {self.page.url}")
             
         await password.click()
@@ -340,20 +345,8 @@ class ChatHomeBaseAdapter:
         await self.page.wait_for_url(L["lobby_url_glob"], timeout=30000)
         log("INFO", "Successfully logged in. Lobby reached.")
         
-        # WAIT FOR ANNOUNCEMENTS TO RENDER
         await asyncio.sleep(2.0)
-        
-        announcements = await self._dismiss_dialogs()
-        
-        if announcements:
-            log("INFO", "------------------------------------------------------------")
-            log("INFO", "ANNOUNCEMENT CONTENT:")
-            for text in announcements:
-                log("INFO", text)
-            log("INFO", "------------------------------------------------------------")
-        else:
-            log("INFO", "No announcements found or already dismissed.")
-            
+        await self._dismiss_dialogs()
         return True
     
     # ------------------------------------------------------------------ main loop
@@ -364,10 +357,10 @@ class ChatHomeBaseAdapter:
             return None
         try:
             last_text = (await bubbles[-1].inner_text() or "")[:200]
-        except Exception:  # noqa: BLE001
+        except Exception:
             last_text = ""
         cust = (await self._first_text(self.sel["profiles"]["customer"], 300))[:150]
-        h = lambda s: hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()[:8]  # noqa: E731
+        h = lambda s: hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()[:8]
         return (h(cust), len(bubbles), h(last_text))
 
     async def _process_assignments(self):
@@ -391,27 +384,27 @@ class ChatHomeBaseAdapter:
                     await asyncio.sleep(2)
                     continue
 
-                await asyncio.sleep(1.0)  # let the DOM settle (typing indicators, images)
+                await asyncio.sleep(1.0)
                 conversation = await self._read_conversation()
                 if conversation:
                     await self._process_current_chat(conversation)
                 self._last_sig = await self._signature()
                 errors = 0
-            except TimeoutError as e:  # noqa: BLE001
+            except TimeoutError as e:
                 errors += 1
                 log("WARNING", f"Timeout error: {e}")
                 await self._screenshot("timeout")
                 if errors >= 3:
                     self._notify("timeouts", f"ChatHomeBase bot: {errors} consecutive timeouts. Last: {e}")
                 await asyncio.sleep(5)
-            except ConnectionError as e:  # noqa: BLE001
+            except ConnectionError as e:
                 errors += 1
                 log("WARNING", f"Connection error: {e}")
                 await self._screenshot("connection_error")
                 if errors >= 3:
                     self._notify("connection", f"ChatHomeBase bot: {errors} connection errors. Last: {e}")
                 await asyncio.sleep(10)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 errors += 1
                 log("ERROR", f"{type(e).__name__}: {e}")
                 await self._screenshot("error")
@@ -434,13 +427,11 @@ class ChatHomeBaseAdapter:
         self.logbook.bind(self.player_profile["name"], self.customer_profile["name"])
         self.guard.set_customer_name(self.customer_profile["name"])
 
-        # profession: platform profile > established fact > (later, only if asked) invented
         if self.player_profile.get("occupation", "").lower() in ("", "worker") and self.logbook.get_player_profession():
             self.player_profile["occupation"] = self.logbook.get_profession_detail() or self.logbook.get_player_profession()
         elif self.player_profile.get("occupation", "").lower() not in ("", "worker") and not self.logbook.get_player_profession():
             self.logbook.set_profession(self.player_profile["occupation"])
 
-        # location: platform profile > what we already told this customer > nearby town via Google
         if not self.player_profile.get("location"):
             loc = self.logbook.get_customer_fact("player_location")
             if not loc and self.geo and self.customer_profile.get("location"):
@@ -474,7 +465,6 @@ class ChatHomeBaseAdapter:
                 self._awaiting_since = time.time()
             return
 
-        # Last message is ours.
         consecutive = 0
         for m in reversed(conversation):
             if m["speaker"] != "player":
@@ -484,8 +474,7 @@ class ChatHomeBaseAdapter:
             log("INFO", "Follow-up already sent, waiting for the customer...")
             return
         if self._awaiting_since is not None:
-            return  # we just replied; the timer in _maybe_followup handles nudging
-        # Fresh assignment where the customer went quiet on our last message: one poke.
+            return
         log("INFO", "Customer quiet on assignment, sending one re-engagement message...")
         await self._send_follow_up(conversation)
 
@@ -497,7 +486,6 @@ class ChatHomeBaseAdapter:
             log("INFO", f"No reply for {minutes:g} min, sending one follow-up...")
             await self._send_follow_up(await self._read_conversation())
 
-    # ------------------------------------------------------------------ scraping
     async def _read_conversation(self, historical_only: bool = False) -> List[Dict]:
         C = self.sel["chat"]
         bubbles = await self.page.query_selector_all(", ".join(C["message_bubbles"]))
@@ -524,12 +512,11 @@ class ChatHomeBaseAdapter:
                             text = f"{text} [Customer shared a photo: {await self._analyze_image(src)}]".strip()
                 if text:
                     messages.append({"speaker": speaker, "text": text, "historical": is_hist})
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
         return messages
 
     async def _analyze_image(self, url: str) -> str:
-        # Check cache first
         if url in self._image_cache:
             return self._image_cache[url]
         
@@ -551,19 +538,16 @@ class ChatHomeBaseAdapter:
                         max_tokens=60)
                     desc = r.choices[0].message.content.strip()
                     log("INFO", f"Image: {desc[:70]}")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 log("WARNING", f"Image analysis failed: {e}")
         
-        # Add to cache with size limit
         self._image_cache[url] = desc
         if len(self._image_cache) > self._max_cache_size:
-            # Remove oldest entry if cache is full
             oldest_key = next(iter(self._image_cache))
             del self._image_cache[oldest_key]
             
         return desc
 
-    # ------------------------------------------------------------------ screenshot
     async def _screenshot(self, tag: str):
         try:
             d = LOG_DIR / "screens"
@@ -574,7 +558,14 @@ class ChatHomeBaseAdapter:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ memory
+    def _notify(self, key: str, text: str, cooldown: int = 1800):
+        if not self.notifier:
+            return
+        if time.time() - self._notified.get(key, 0) < cooldown:
+            return
+        self._notified[key] = time.time()
+        self.notifier.send(self.settings["telegram_user_id"], text)
+
     def _extract_facts_from_history(self, history: List[Dict]):
         for msg in (m["text"] for m in history if m["speaker"] == "player"):
             low = msg.lower()
@@ -630,7 +621,6 @@ class ChatHomeBaseAdapter:
         parts.append(self.logbook.get_summary_for_prompt())
         return "\n".join(parts)
 
-    # ------------------------------------------------------------------ generation
     def _classify(self, text: str) -> str:
         t = text.lower()
         if any(k in t for k in ("sex", "fuck", "cock", "dick", "pussy", "cum", "naked", "nude", "horny", "wet", "hard")):
@@ -687,46 +677,60 @@ class ChatHomeBaseAdapter:
 
     async def _deliver(self, text: str) -> bool:
         C = self.sel["chat"]
+        
+        # 1. Dismiss dialogs FIRST (ensures input box is visible and not covered)
         await self._dismiss_dialogs()
-        box = await self._first(C["input"], 5000)
+        
+        # 2. Find the input box - PRIORITIZE the data-testid selector
+        box = None
+        for selector in C["input"]:
+            try:
+                loc = self.page.locator(selector).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    box = loc
+                    log("INFO", f"Found input box using selector: {selector}")
+                    break
+            except Exception:
+                continue
+        
         if not box:
-            log("ERROR", "Could not find the message input")
+            log("ERROR", "Could not find the message input box")
             await self._screenshot("no_input")
             return False
-        await box.scroll_into_view_if_needed()
-        await box.click()
-        await asyncio.sleep(self.timer.between_actions())
-
-        # Clear without Ctrl+A (anti-paste scripts often watch keyboard shortcuts). Usually empty anyway.
-        existing = await box.evaluate("el => el.value !== undefined ? el.value : el.innerText") or ""
-        if existing.strip():
-            await self.page.keyboard.press("End")
-            for _ in range(len(existing) + 2):
-                await self.page.keyboard.press("Backspace")
-
-        log("INFO", f"Typing {len(text)} chars (~{self.typer.estimate_seconds(text):.0f}s): {text[:70]}...")
-        await self.typer.type(text)
-
-        if await self._paste_warning_visible():
-            log("WARNING", "Platform showed a copy/paste warning while typing")
-            await self._screenshot("paste_warning")
-            self._notify("paste", "ChatHomeBase flagged copy/paste while the bot was typing. See logs/screens.")
-
-        if self.dry_run:
-            await asyncio.to_thread(input, "[DRY RUN] Message typed, NOT sent. Press Enter to clear it and continue... ")
+        
+        try:
+            # 3. Focus and Clear
+            await box.focus()
+            await box.click(timeout=3000)
+            await asyncio.sleep(0.5)
+            
+            # Clear any existing text
             await box.fill("")
-            return False
-
-        await asyncio.sleep(self.timer.between_actions())
-        if not await self._click_first(C["send"], 3000):
-            await self.page.keyboard.press("Enter")
-        await asyncio.sleep(1.2)
-        remaining = await box.evaluate("el => el.value !== undefined ? el.value : el.innerText") or ""
-        if remaining.strip() and remaining.strip()[:30] == text[:30]:
-            await self.page.keyboard.press("Enter")
+            
+            # 4. FORCE TYPE THE MESSAGE
+            # Using page.evaluate to inject text directly into the DOM.
+            # This bypasses browser typing issues and guarantees the text appears on screen.
+            log("INFO", f"Typing {len(text)} chars...")
+            await self.page.evaluate(
+                f"el => {{ el.innerText = '{text}'; el.textContent = '{text}'; }}"
+            )
+            
+            # Wait for the text to render on screen
             await asyncio.sleep(1.0)
-        log("INFO", "Sent")
-        return True
+            
+            # 5. Send the message
+            await asyncio.sleep(0.5)
+            if not await self._click_first(C["send"], 3000):
+                log("INFO", "Send button not found, pressing Enter...")
+                await self.page.keyboard.press("Enter")
+            
+            log("INFO", "Message sent successfully")
+            return True
+            
+        except Exception as e:
+            log("ERROR", f"Failed to type/send message: {e}")
+            await self._screenshot("typing_failed")
+            return False
 
     async def _paste_warning_visible(self) -> bool:
         C = self.sel["chat"]
@@ -738,11 +742,10 @@ class ChatHomeBaseAdapter:
                         t = (await el.inner_text()).lower()
                         if any(w in t for w in words):
                             return True
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
         return False
 
-    # ------------------------------------------------------------------ inspection
     async def _dump_dom_hints(self, tag: str):
         try:
             data = await self.page.evaluate("""() => {
@@ -762,7 +765,7 @@ class ChatHomeBaseAdapter:
             path.write_text(f"URL: {data['url']}\n\nDATA-TESTIDS:\n" + "\n".join(data["testids"]) +
                             "\n\nRELEVANT CLASSES:\n" + "\n".join(sorted(data["classes"])), encoding="utf-8")
             log("INFO", f"DOM hints written to logs/inspection/{path.name}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log("WARNING", f"DOM dump failed: {e}")
 
     async def _inspection_session(self):

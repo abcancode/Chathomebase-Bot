@@ -1,12 +1,35 @@
 {
-  "_comment": "Edit after running INSPECT. First matching selector in each list wins.",
+  "_comment": "Aggressive selectors for modern login forms.",
   "login": {
     "url": "https://chathomebase.com/login",
     "lobby_url": "https://chathomebase.com/chat/lobby",
     "lobby_url_glob": "**/chat/**",
-    "email": ["input[name='email']", "input[type='email']"],
-    "password": ["input[name='password']", "input[type='password']"],
-    "submit": ["[data-testid='signInButton']", "button[type='submit']"],
+    "email": [
+      "input[name='email']",
+      "input[type='email']",
+      "input[placeholder*='email']",
+      "input[placeholder*='Email']",
+      "input[placeholder*='Email Address']",
+      "input[aria-label*='email']",
+      "input[aria-label*='Email']"
+    ],
+    "password": [
+      "input[name='password']",
+      "input[type='password']",
+      "input[placeholder*='password']",
+      "input[placeholder*='Password']",
+      "input[placeholder*='Your password']",
+      "input[aria-label*='password']",
+      "input[aria-label*='Password']"
+    ],
+    "submit": [
+      "[data-testid='signInButton']",
+      "button[type='submit']",
+      "button:has-text('Login')",
+      "button:has-text('Log In')",
+      "button:has-text('Enter')",
+      "button:has-text('Sign In')"
+    ],
     "announcement_button": ["[data-testid='announcementsButton']"],
     "announcement_next": [
       "[data-testid='announcementsDialogNextButton']",
