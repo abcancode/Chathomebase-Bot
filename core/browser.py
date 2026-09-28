@@ -3,7 +3,8 @@ from typing import Optional, Tuple
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
 
-INSPECT_SIZE = (1280, 720)
+# Increased size to accommodate the Playwright Inspector column on the right
+INSPECT_SIZE = (1600, 900)
 
 # For Windows: NO sandbox flags (they cause the warning on Windows)
 BASE_ARGS = [
@@ -47,7 +48,11 @@ INSPECTOR_JS = r"""
     let s = t.tagName.toLowerCase();
     if (t.id) s += '#' + t.id;
     if (t.dataset && t.dataset.testid) s += '[data-testid=' + t.dataset.testid + ']';
+<<<<<<< HEAD
     if (typeof t.className === 'string' && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
+=======
+    if (typeof t.className === "string" && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
     return s;
   };
   const watched = ['paste', 'copy', 'cut', 'beforeinput', 'input', 'keydown', 'keypress', 'keyup', 'drop', 'compositionstart'];
@@ -103,8 +108,14 @@ async def launch_browser(
     
     if inspect:
         w, h = INSPECT_SIZE
+        # Set the initial OS window size
         kwargs["args"] = BASE_ARGS + [f"--window-size={w},{h}"]
-        kwargs["viewport"] = {"width": w, "height": h}
+        
+        # FIX: Enable no_viewport to match Live mode.
+        # This allows the browser to dynamically stretch to fill the available window space 
+        # (which shrinks when the Playwright Inspector opens), preventing zoom artifacts.
+        kwargs["no_viewport"] = True
+        
     else:
         kwargs["args"] = BASE_ARGS + ["--start-maximized"]
         kwargs["no_viewport"] = True
@@ -136,7 +147,11 @@ async def launch_browser(
     for ch in ([channel] if channel else ["chrome", None]):
         try:
             context = await pw.chromium.launch_persistent_context(str(final_profile_dir), channel=ch, **kwargs)
+<<<<<<< HEAD
             print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1280x720' if inspect else 'maximised'})")
+=======
+            print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1600x900 (no viewport)' if inspect else 'maximised (no viewport)'})")
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
             break
         except Exception as e:
             print(f"[WARNING] Could not launch {ch or 'bundled chromium'}: {str(e).splitlines()[0]}")

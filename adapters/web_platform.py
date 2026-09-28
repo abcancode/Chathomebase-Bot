@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import openai
 import random
 import re
 import time
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from langdetect import detect, LangDetectException
 
 from core.browser import launch_browser, INSPECTOR_JS
 from core.deepseek_client import DeepSeekClient
@@ -113,8 +115,52 @@ class ChatHomeBaseAdapter:
         self._last_sig: Optional[Tuple] = None
         self._awaiting_since: Optional[float] = None
         self._followup_sent = False
+<<<<<<< HEAD
         self._image_cache: Dict[str, str] = {}
         self._max_cache_size = 100
+=======
+        self._image_cache: Dict[str, Tuple[str, str]] = {}
+        self._max_cache_size = 100
+
+    def detect_language(self, text: str) -> str:
+        """Detects the primary language of the text."""
+        try:
+            return detect(text)
+        except LangDetectException:
+            return 'en'
+
+    async def _logout(self):
+        """Logs out by closing the context and browser."""
+        log("INFO", "Logging out...")
+        try:
+            if self.context:
+                await self.context.close()
+            if self.playwright:
+                await self.playwright.stop()
+        except Exception as e:
+            log("WARNING", f"Error during logout: {e}")
+
+    async def _logout_and_restart_wait(self, seconds: int):
+        """Logs out, waits X seconds, then restarts."""
+        log("INFO", f"Non-English detected. Logging out and waiting {seconds//60} minutes...")
+        await self._logout()
+        await asyncio.sleep(seconds)
+        log("INFO", "Restarting bot...")
+        await self.start()
+
+    async def _check_balance_and_restart(self) -> bool:
+        """Checks balance. Returns True if OK, False if low (to stop bot)."""
+        try:
+            balance = await asyncio.to_thread(self.deepseek.check_balance)
+            log("INFO", f"DeepSeek balance: ${balance:.2f}")
+            if balance < 1.0:
+                log("ERROR", "Balance below $1 threshold. Logging out and stopping.")
+                await self._logout()
+                return False
+        except Exception as e:
+            log("WARNING", f"Could not check balance: {e}")
+        return True
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
 
     async def _check_balance(self):
         """Check DeepSeek API balance and notify if below threshold."""
@@ -306,13 +352,30 @@ class ChatHomeBaseAdapter:
             await asyncio.sleep(2.0)
             await self._dismiss_dialogs()
             return True
+<<<<<<< HEAD
             
+=======
+        
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
         log("INFO", "Not on login page. Navigating to login page...")
         await self.page.bring_to_front()
         await asyncio.sleep(1.5)
         
+<<<<<<< HEAD
         await self.page.goto(L["url"], wait_until="networkidle")
         log("INFO", "Navigated to login URL")
+=======
+        # IMPROVEMENT: Try networkidle, but fallback to domcontentloaded if it times out
+        # This prevents the 30s timeout crash on slow connections
+        try:
+            await self.page.goto(L["url"], wait_until="networkidle", timeout=20000)
+            log("INFO", "Navigated to login URL (networkidle)")
+        except Exception as e:
+            log("WARNING", f"Networkidle timeout, falling back to domcontentloaded: {e}")
+            await self.page.goto(L["url"], wait_until="domcontentloaded", timeout=15000)
+            log("INFO", "Navigated to login URL (domcontentloaded fallback)")
+            
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
         await asyncio.sleep(2.0)
         
         log("INFO", "Waiting for login form...")
@@ -365,7 +428,16 @@ class ChatHomeBaseAdapter:
 
     async def _process_assignments(self):
         errors = 0
+        # IMPROVEMENT: Add a counter to throttle balance checks
+        balance_check_counter = 0
         while True:
+            # Check balance every 30 iterations (approx 1 minute) instead of every 2 seconds
+            balance_check_counter += 1
+            if balance_check_counter > 15: 
+                if not await self._check_balance_and_restart():
+                    return # Stop the bot completely
+                balance_check_counter = 0
+            
             try:
                 sig = await self._signature()
                 if sig is None:
@@ -459,6 +531,13 @@ class ChatHomeBaseAdapter:
             log("INFO", f"Customer: {last['text'][:80]}")
             self._awaiting_since = None
             self._note_customer_info(last["text"])
+            
+            # Check if message is non-English
+            if self.detect_language(last["text"]) != 'en':
+                log("INFO", "Message is not in English. Logging out and waiting 7 minutes...")
+                await self._logout_and_restart_wait(7 * 60)
+                return # Stop processing this chat
+            
             await asyncio.sleep(self.timer.reading_delay(len(last["text"])))
             reply = await self._generate_reply(last, conversation)
             if reply and await self._deliver(reply):
@@ -504,49 +583,119 @@ class ChatHomeBaseAdapter:
                     continue
                 text_el = await b.query_selector(", ".join(C["message_text"]))
                 text = ((await text_el.inner_text()) if text_el else (await b.inner_text())).strip()
+                
+                # --- IMAGE PROCESSING & COMPLIMENT LOGIC ---
                 if speaker == "customer":
                     img = await b.query_selector(", ".join(C["message_image"]))
                     if img:
                         src = await img.get_attribute("src")
                         if src and not src.startswith("data:image/svg") and "avatar" not in src.lower():
-                            text = f"{text} [Customer shared a photo: {await self._analyze_image(src)}]".strip()
+                            desc, compliment = await self._analyze_image(src)
+                            # Inject description and compliment into the text
+                            text = f"{text} [Customer shared a photo: {desc}. {compliment}]"
+                # ------------------------------------------
+                
                 if text:
                     messages.append({"speaker": speaker, "text": text, "historical": is_hist})
+<<<<<<< HEAD
+=======
+                    
+                    # --- NON-ENGLISH DETECTION ---
+                    # If customer speaks Spanish, French, etc., trigger logout/timeout
+                    try:
+                        detected_lang = detect(text)
+                        if detected_lang != 'en' and not historical_only:
+                            log("INFO", f"Detected non-English language ({detected_lang}). Logging out...")
+                            await self._logout_and_restart_wait(7 * 60)
+                            return []
+                    except LangDetectException:
+                        pass
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
             except Exception:
                 continue
         return messages
 
+<<<<<<< HEAD
     async def _analyze_image(self, url: str) -> str:
+=======
+    async def _analyze_image(self, url: str) -> Tuple[str, str]:
+        """Analyzes an image. Returns (description, compliment)."""
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
         if url in self._image_cache:
             return self._image_cache[url]
         
         desc = "photo"
+        compliment = "Nice photo!"
+        
         if self.openai_key:
             try:
                 data_url = await self.page.evaluate(
-                    """async (u) => { const r = await fetch(u); const b = await r.blob();
-                       return await new Promise(res => { const fr = new FileReader();
-                       fr.onloadend = () => res(fr.result); fr.readAsDataURL(b); }); }""", url)
+                    """async (u) => { 
+                        const r = await fetch(u); 
+                        const b = await r.blob();
+                        return await new Promise(res => { 
+                            const fr = new FileReader(); 
+                            fr.onloadend = () => res(fr.result); 
+                            fr.readAsDataURL(b); 
+                        }); 
+                    }""", url)
+                
                 if data_url and str(data_url).startswith("data:"):
-                    import openai
                     client = openai.AsyncOpenAI(api_key=self.openai_key)
                     r = await client.chat.completions.create(
                         model=self.settings.get("openai_vision_model", "gpt-4o-mini"),
-                        messages=[{"role": "user", "content": [
-                            {"type": "text", "text": "Describe this photo in one short factual sentence: who or what is shown, setting, notable details. Under 25 words."},
-                            {"type": "image_url", "image_url": {"url": data_url}}]}],
-                        max_tokens=60)
+                        messages=[{
+                            "role": "user", 
+                            "content": [
+                                {
+                                    "type": "text", 
+                                    "text": """Analyze the photo. Describe the subject's clothing. 
+                                               Is the subject naked, wearing underwear, a bikini, or lingerie?
+                                               If yes, explicitly state 'Nude' or 'Minimal Clothing'.
+                                               Otherwise, describe the clothing in detail.
+                                               Also check if it is a pet, family member, sibling, or selfie."""
+                                },
+                                {"type": "image_url", "image_url": {"url": data_url}}
+                            ]
+                        }],
+                        max_tokens=50
+                    )
                     desc = r.choices[0].message.content.strip()
+<<<<<<< HEAD
                     log("INFO", f"Image: {desc[:70]}")
             except Exception as e:
                 log("WARNING", f"Image analysis failed: {e}")
         
         self._image_cache[url] = desc
+=======
+                    
+                    # --- COMPLIMENT LOGIC ---
+                    low_desc = desc.lower()
+                    if "nude" in low_desc or "naked" in low_desc:
+                        compliment = "You look amazing!"
+                    elif "dick" in low_desc or "cock" in low_desc:
+                        compliment = "Nice pic!"
+                    elif "dog" in low_desc or "cat" in low_desc or "pet" in low_desc:
+                        compliment = "What a cute pet!"
+                    elif "family" in low_desc or "sibling" in low_desc or "brother" in low_desc or "sister" in low_desc:
+                        compliment = "Great family moment!"
+                    elif "smiling" in low_desc or "selfie" in low_desc:
+                        compliment = "Love the vibe in this photo!"
+                    else:
+                        compliment = "Nice photo!"
+                    # -------------------------
+                    
+                    log("INFO", f"Image: {desc[:70]} | Compliment: {compliment}")
+            except Exception as e:
+                log("WARNING", f"Image analysis failed: {e}")
+        
+        self._image_cache[url] = (desc, compliment)
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
         if len(self._image_cache) > self._max_cache_size:
             oldest_key = next(iter(self._image_cache))
             del self._image_cache[oldest_key]
             
-        return desc
+        return desc, compliment
 
     async def _screenshot(self, tag: str):
         try:
@@ -566,6 +715,27 @@ class ChatHomeBaseAdapter:
         self._notified[key] = time.time()
         self.notifier.send(self.settings["telegram_user_id"], text)
 
+<<<<<<< HEAD
+    async def _screenshot(self, tag: str):
+        try:
+            d = LOG_DIR / "screens"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.png"
+            await self.page.screenshot(path=str(path), full_page=False)
+            log("INFO", f"Screenshot: {path.name}")
+        except Exception:
+            pass
+
+    def _notify(self, key: str, text: str, cooldown: int = 1800):
+        if not self.notifier:
+            return
+        if time.time() - self._notified.get(key, 0) < cooldown:
+            return
+        self._notified[key] = time.time()
+        self.notifier.send(self.settings["telegram_user_id"], text)
+
+=======
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
     def _extract_facts_from_history(self, history: List[Dict]):
         for msg in (m["text"] for m in history if m["speaker"] == "player"):
             low = msg.lower()
@@ -681,6 +851,7 @@ class ChatHomeBaseAdapter:
         # 1. Dismiss dialogs FIRST (ensures input box is visible and not covered)
         await self._dismiss_dialogs()
         
+<<<<<<< HEAD
         # 2. Find the input box - PRIORITIZE the data-testid selector
         box = None
         for selector in C["input"]:
@@ -701,11 +872,28 @@ class ChatHomeBaseAdapter:
         try:
             # 3. Focus and Clear
             await box.focus()
+=======
+        # 2. Use the specific selector found in your test file
+        # messageTextArea is the data-testid for the input box
+        try:
+            box = self.page.get_by_test_id("messageTextArea")
+            
+            # Ensure the box is visible
+            try:
+                await box.is_visible(timeout=3000)
+            except:
+                log("ERROR", "Input box not visible even after dismissal")
+                await self._screenshot("no_input_visible")
+                return False
+            
+            # 3. Focus the input box
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
             await box.click(timeout=3000)
             await asyncio.sleep(0.5)
             
             # Clear any existing text
             await box.fill("")
+<<<<<<< HEAD
             
             # 4. FORCE TYPE THE MESSAGE
             # Using page.evaluate to inject text directly into the DOM.
@@ -717,6 +905,13 @@ class ChatHomeBaseAdapter:
             
             # Wait for the text to render on screen
             await asyncio.sleep(1.0)
+=======
+            await asyncio.sleep(0.2) # Small pause after clearing
+            
+            # 4. Type the message using human-like typing
+            log("INFO", f"Typing {len(text)} chars...")
+            await box.type(text, delay=random.randint(30, 70)) # Typing with a small delay for realism
+>>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
             
             # 5. Send the message
             await asyncio.sleep(0.5)
@@ -776,7 +971,13 @@ class ChatHomeBaseAdapter:
         print(" - Everything the page does with paste/input/key events is printed here as [PAGE] lines.")
         print(" - Open a chat, then press Resume (play button) in the Inspector to continue.")
         print("-" * 60 + "\n")
+        
+        # FIX: No Viewport mode allows the browser to resize dynamically with the Inspector
+        # This prevents "zoomed in to the right" issues completely.
+        log("INFO", "Browser is running in No-Viewport mode.")
+        
         await self.page.pause()
+
         await self._dump_dom_hints("chat")
         answer = await asyncio.to_thread(input, "Run a typing test into the chat input now? (y/n): ")
         if answer.strip().lower().startswith("y"):
