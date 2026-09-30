@@ -1,40 +1,60 @@
 @echo off
-cd /d "%~dp0"
-title ChatHomeBase Bot Updater
-
+chcp 65001 >nul
 setlocal enabledelayedexpansion
+
+title ChatHomeBase Bot Updater
 
 echo =======================================
 echo ChatHomeBase Bot Updater
 echo =======================================
 echo.
 
-:: Check if curl is installed
+:: 1. Check if curl is installed
 where curl >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] 'curl' is not installed on this system.
     echo Please install curl or update your PATH environment variable.
+    echo.
     pause
     exit /b 1
 )
+echo [OK] curl found.
+
+:: 2. Check if PowerShell is installed
+where powershell >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] 'powershell' is not installed on this system.
+    echo Please install Windows PowerShell.
+    echo.
+    pause
+    exit /b 1
+)
+echo [OK] PowerShell found.
+
+:: 3. Check if Python is installed (Required for the bot)
+where python >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [WARNING] Python is not installed. The bot will not run.
+    echo Please install Python from python.org
+    echo.
+) else (
+    echo [OK] Python found.
+)
 
 :: ==========================================
-:: IMPORTANT: UPDATE THESE TO YOUR REPO URL
-:: Replace with the actual GitHub repository URLs
+:: SETTINGS
 :: ==========================================
-:: Example: https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/version.txt
+:: Replace with your actual GitHub repository URLs
 set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
-
-:: Example: https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0.0/latest.zip
-set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.7/latest.zip
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.14/latest.zip
 :: ==========================================
 
-echo Checking for updates...
-echo From: %VERSION_URL%
+echo.
+echo Target URL: %VERSION_URL%
 echo.
 
 if not exist "version.txt" (
-    echo Creating version.txt...
+    echo Creating local version.txt...
     echo 0.0.0 > version.txt
 )
 
@@ -43,6 +63,8 @@ curl -s -L "%VERSION_URL%" > .latest_version 2>&1
 
 if not exist ".latest_version" (
     echo [ERROR] Failed to download version info. Check internet/connection.
+    echo The file does not exist on GitHub.
+    echo.
     pause
     exit /b 1
 )
@@ -69,6 +91,7 @@ if "%CURRENT%"=="%LATEST%" (
     echo You are up to date!
     echo =======================================
     del .latest_version
+    echo.
     pause
     exit /b 0
 )
@@ -78,34 +101,39 @@ echo Update available: %CURRENT% -^> %LATEST%
 echo =======================================
 echo.
 
+:: 1. Backup Settings
 if exist "config\settings.json" (
-    echo [1/4] Backing up settings...
-    copy "config\settings.json" "config\settings.json.backup" >nul
+    echo [1/5] Backing up settings...
+    copy "config\settings.json" "config\settings.json.backup" >nul 2>&1
     if errorlevel 1 (
-        echo [ERROR] Failed to backup settings
+        echo [ERROR] Failed to backup settings to config\settings.json.backup
         pause
         exit /b 1
     )
     echo     OK
 ) else (
-    echo [1/4] No settings to backup
+    echo [1/5] No settings to backup
 )
 
-echo [2/4] Downloading update...
+:: 2. Download Update
+echo [2/5] Downloading update package...
 curl -L -o update.zip "%DOWNLOAD_URL%" 2>&1
 
 if not exist update.zip (
-    echo [ERROR] Download failed. Check URL and internet.
+    echo [ERROR] Download failed. Check URL and internet connection.
+    echo The file download might have been interrupted.
     del .latest_version 2>nul
     pause
     exit /b 1
 )
 echo     OK
 
-echo [3/4] Extracting update...
+:: 3. Extract Update
+echo [3/5] Extracting update package...
 powershell -Command "Expand-Archive -Path 'update.zip' -DestinationPath '.' -Force"
 if errorlevel 1 (
     echo [ERROR] Extraction failed. The zip file might be corrupted or missing.
+    echo Please check the 'update.zip' file size.
     del update.zip 2>nul
     del .latest_version 2>nul
     pause
@@ -113,14 +141,16 @@ if errorlevel 1 (
 )
 echo     OK
 
+:: 4. Restore Settings
 if exist "config\settings.json.backup" (
-    echo [4/4] Restoring settings...
-    copy "config\settings.json.backup" "config\settings.json" >nul
+    echo [4/5] Restoring settings...
+    copy "config\settings.json.backup" "config\settings.json" >nul 2>&1
     del "config\settings.json.backup" 2>nul
     echo     OK
 )
 
-copy .latest_version version.txt >nul
+:: 5. Update Version File
+copy .latest_version version.txt >nul 2>&1
 del update.zip 2>nul
 del .latest_version 2>nul
 
@@ -130,4 +160,5 @@ echo Update complete! Version %LATEST%
 echo =======================================
 echo You can now run LAUNCH.bat
 echo.
-pause
+echo Press any key to close this window...
+pause >nul
