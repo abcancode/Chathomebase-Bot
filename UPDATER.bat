@@ -57,7 +57,7 @@ set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/mai
 <<<<<<< HEAD
 set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.15/latest.zip
 =======
-set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.16/latest.zip
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.17/latest.zip
 >>>>>>> c8748f9 (Add version file for update checks)
 :: ==========================================
 
