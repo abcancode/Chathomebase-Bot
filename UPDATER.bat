@@ -54,7 +54,7 @@ if %errorlevel% neq 0 (
 :: ==========================================
 :: Replace with your actual GitHub repository URLs
 set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
-set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.18/latest.zip
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.19/latest.zip
 
 echo.
 echo Target URL: %VERSION_URL%
