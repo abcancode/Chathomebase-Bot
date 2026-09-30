@@ -116,9 +116,12 @@ class ChatHomeBaseAdapter:
         self._awaiting_since: Optional[float] = None
         self._followup_sent = False
 <<<<<<< HEAD
+<<<<<<< HEAD
         self._image_cache: Dict[str, str] = {}
         self._max_cache_size = 100
 =======
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
         self._image_cache: Dict[str, Tuple[str, str]] = {}
         self._max_cache_size = 100
 
@@ -160,7 +163,10 @@ class ChatHomeBaseAdapter:
         except Exception as e:
             log("WARNING", f"Could not check balance: {e}")
         return True
+<<<<<<< HEAD
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
 
     async def _check_balance(self):
         """Check DeepSeek API balance and notify if below threshold."""
@@ -353,18 +359,25 @@ class ChatHomeBaseAdapter:
             await self._dismiss_dialogs()
             return True
 <<<<<<< HEAD
+<<<<<<< HEAD
             
 =======
         
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+        
+>>>>>>> c8748f9 (Add version file for update checks)
         log("INFO", "Not on login page. Navigating to login page...")
         await self.page.bring_to_front()
         await asyncio.sleep(1.5)
         
 <<<<<<< HEAD
+<<<<<<< HEAD
         await self.page.goto(L["url"], wait_until="networkidle")
         log("INFO", "Navigated to login URL")
 =======
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
         # IMPROVEMENT: Try networkidle, but fallback to domcontentloaded if it times out
         # This prevents the 30s timeout crash on slow connections
         try:
@@ -375,7 +388,10 @@ class ChatHomeBaseAdapter:
             await self.page.goto(L["url"], wait_until="domcontentloaded", timeout=15000)
             log("INFO", "Navigated to login URL (domcontentloaded fallback)")
             
+<<<<<<< HEAD
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
         await asyncio.sleep(2.0)
         
         log("INFO", "Waiting for login form...")
@@ -598,7 +614,10 @@ class ChatHomeBaseAdapter:
                 if text:
                     messages.append({"speaker": speaker, "text": text, "historical": is_hist})
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
                     
                     # --- NON-ENGLISH DETECTION ---
                     # If customer speaks Spanish, French, etc., trigger logout/timeout
@@ -610,17 +629,25 @@ class ChatHomeBaseAdapter:
                             return []
                     except LangDetectException:
                         pass
+<<<<<<< HEAD
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
             except Exception:
                 continue
         return messages
 
+<<<<<<< HEAD
 <<<<<<< HEAD
     async def _analyze_image(self, url: str) -> str:
 =======
     async def _analyze_image(self, url: str) -> Tuple[str, str]:
         """Analyzes an image. Returns (description, compliment)."""
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+    async def _analyze_image(self, url: str) -> Tuple[str, str]:
+        """Analyzes an image. Returns (description, compliment)."""
+>>>>>>> c8748f9 (Add version file for update checks)
         if url in self._image_cache:
             return self._image_cache[url]
         
@@ -662,6 +689,7 @@ class ChatHomeBaseAdapter:
                     )
                     desc = r.choices[0].message.content.strip()
 <<<<<<< HEAD
+<<<<<<< HEAD
                     log("INFO", f"Image: {desc[:70]}")
             except Exception as e:
                 log("WARNING", f"Image analysis failed: {e}")
@@ -691,11 +719,36 @@ class ChatHomeBaseAdapter:
         
         self._image_cache[url] = (desc, compliment)
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+                    
+                    # --- COMPLIMENT LOGIC ---
+                    low_desc = desc.lower()
+                    if "nude" in low_desc or "naked" in low_desc:
+                        compliment = "You look amazing!"
+                    elif "dick" in low_desc or "cock" in low_desc:
+                        compliment = "Nice pic!"
+                    elif "dog" in low_desc or "cat" in low_desc or "pet" in low_desc:
+                        compliment = "What a cute pet!"
+                    elif "family" in low_desc or "sibling" in low_desc or "brother" in low_desc or "sister" in low_desc:
+                        compliment = "Great family moment!"
+                    elif "smiling" in low_desc or "selfie" in low_desc:
+                        compliment = "Love the vibe in this photo!"
+                    else:
+                        compliment = "Nice photo!"
+                    # -------------------------
+                    
+                    log("INFO", f"Image: {desc[:70]} | Compliment: {compliment}")
+            except Exception as e:
+                log("WARNING", f"Image analysis failed: {e}")
+        
+        self._image_cache[url] = (desc, compliment)
+>>>>>>> c8748f9 (Add version file for update checks)
         if len(self._image_cache) > self._max_cache_size:
             oldest_key = next(iter(self._image_cache))
             del self._image_cache[oldest_key]
             
         return desc, compliment
+<<<<<<< HEAD
 
     async def _screenshot(self, tag: str):
         try:
@@ -736,6 +789,27 @@ class ChatHomeBaseAdapter:
 
 =======
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+
+    async def _screenshot(self, tag: str):
+        try:
+            d = LOG_DIR / "screens"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.png"
+            await self.page.screenshot(path=str(path), full_page=False)
+            log("INFO", f"Screenshot: {path.name}")
+        except Exception:
+            pass
+
+    def _notify(self, key: str, text: str, cooldown: int = 1800):
+        if not self.notifier:
+            return
+        if time.time() - self._notified.get(key, 0) < cooldown:
+            return
+        self._notified[key] = time.time()
+        self.notifier.send(self.settings["telegram_user_id"], text)
+
+>>>>>>> c8748f9 (Add version file for update checks)
     def _extract_facts_from_history(self, history: List[Dict]):
         for msg in (m["text"] for m in history if m["speaker"] == "player"):
             low = msg.lower()
@@ -852,6 +926,7 @@ class ChatHomeBaseAdapter:
         await self._dismiss_dialogs()
         
 <<<<<<< HEAD
+<<<<<<< HEAD
         # 2. Find the input box - PRIORITIZE the data-testid selector
         box = None
         for selector in C["input"]:
@@ -873,6 +948,8 @@ class ChatHomeBaseAdapter:
             # 3. Focus and Clear
             await box.focus()
 =======
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
         # 2. Use the specific selector found in your test file
         # messageTextArea is the data-testid for the input box
         try:
@@ -887,12 +964,16 @@ class ChatHomeBaseAdapter:
                 return False
             
             # 3. Focus the input box
+<<<<<<< HEAD
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
             await box.click(timeout=3000)
             await asyncio.sleep(0.5)
             
             # Clear any existing text
             await box.fill("")
+<<<<<<< HEAD
 <<<<<<< HEAD
             
             # 4. FORCE TYPE THE MESSAGE
@@ -906,12 +987,17 @@ class ChatHomeBaseAdapter:
             # Wait for the text to render on screen
             await asyncio.sleep(1.0)
 =======
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
             await asyncio.sleep(0.2) # Small pause after clearing
             
             # 4. Type the message using human-like typing
             log("INFO", f"Typing {len(text)} chars...")
             await box.type(text, delay=random.randint(30, 70)) # Typing with a small delay for realism
+<<<<<<< HEAD
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+>>>>>>> c8748f9 (Add version file for update checks)
             
             # 5. Send the message
             await asyncio.sleep(0.5)

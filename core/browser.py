@@ -49,10 +49,14 @@ INSPECTOR_JS = r"""
     if (t.id) s += '#' + t.id;
     if (t.dataset && t.dataset.testid) s += '[data-testid=' + t.dataset.testid + ']';
 <<<<<<< HEAD
+<<<<<<< HEAD
     if (typeof t.className === 'string' && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
 =======
     if (typeof t.className === "string" && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+    if (typeof t.className === "string" && t.className) s += '.' + t.className.trim().split(/\\s+/).slice(0, 3).join('.');
+>>>>>>> c8748f9 (Add version file for update checks)
     return s;
   };
   const watched = ['paste', 'copy', 'cut', 'beforeinput', 'input', 'keydown', 'keypress', 'keyup', 'drop', 'compositionstart'];
@@ -148,10 +152,14 @@ async def launch_browser(
         try:
             context = await pw.chromium.launch_persistent_context(str(final_profile_dir), channel=ch, **kwargs)
 <<<<<<< HEAD
+<<<<<<< HEAD
             print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1280x720' if inspect else 'maximised'})")
 =======
             print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1600x900 (no viewport)' if inspect else 'maximised (no viewport)'})")
 >>>>>>> 62018ee (version 1.1.13: Bot typing on UI)
+=======
+            print(f"[INFO] Browser: {ch or 'bundled chromium'} ({'inspect 1600x900 (no viewport)' if inspect else 'maximised (no viewport)'})")
+>>>>>>> c8748f9 (Add version file for update checks)
             break
         except Exception as e:
             print(f"[WARNING] Could not launch {ch or 'bundled chromium'}: {str(e).splitlines()[0]}")

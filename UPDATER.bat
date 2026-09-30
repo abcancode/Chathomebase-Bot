@@ -54,7 +54,11 @@ if %errorlevel% neq 0 (
 :: ==========================================
 :: Replace with your actual GitHub repository URLs
 set VERSION_URL=https://raw.githubusercontent.com/abcancode/Chathomebase-Bot/main/version.txt
+<<<<<<< HEAD
 set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.15/latest.zip
+=======
+set DOWNLOAD_URL=https://github.com/abcancode/Chathomebase-Bot/releases/download/v1.1.16/latest.zip
+>>>>>>> c8748f9 (Add version file for update checks)
 :: ==========================================
 
 echo.
