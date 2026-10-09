@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-from langdetect import detect, LangDetectException
 
 from core.browser import launch_browser, INSPECTOR_JS
 from core.deepseek_client import DeepSeekClient
@@ -118,13 +117,6 @@ class ChatHomeBaseAdapter:
         self._image_cache: Dict[str, Tuple[str, str]] = {}
         self._max_cache_size = 100
 
-    def detect_language(self, text: str) -> str:
-        """Detects the primary language of the text."""
-        try:
-            return detect(text)
-        except LangDetectException:
-            return 'en'
-
     async def _logout(self):
         """Logs out by closing the context and browser."""
         log("INFO", "Logging out...")
@@ -138,7 +130,7 @@ class ChatHomeBaseAdapter:
 
     async def _logout_and_restart_wait(self, seconds: int):
         """Logs out, waits X seconds, then restarts."""
-        log("INFO", f"Non-English detected. Logging out and waiting {seconds//60} minutes...")
+        log("INFO", f"Logging out and waiting {seconds//60} minutes...")
         await self._logout()
         await asyncio.sleep(seconds)
         log("INFO", "Restarting bot...")
@@ -518,12 +510,6 @@ class ChatHomeBaseAdapter:
             self._awaiting_since = None
             self._note_customer_info(last["text"])
             
-            # Check if message is non-English
-            if self.detect_language(last["text"]) != 'en':
-                log("INFO", "Message is not in English. Logging out and waiting 7 minutes...")
-                await self._logout_and_restart_wait(7 * 60)
-                return # Stop processing this chat
-            
             await asyncio.sleep(self.timer.reading_delay(len(last["text"])))
             reply = await self._generate_reply(last, conversation)
             if reply and await self._deliver(reply):
@@ -583,17 +569,6 @@ class ChatHomeBaseAdapter:
                 
                 if text:
                     messages.append({"speaker": speaker, "text": text, "historical": is_hist})
-                    
-                    # --- NON-ENGLISH DETECTION ---
-                    # If customer speaks Spanish, French, etc., trigger logout/timeout
-                    try:
-                        detected_lang = detect(text)
-                        if detected_lang != 'en' and not historical_only:
-                            log("INFO", f"Detected non-English language ({detected_lang}). Logging out...")
-                            await self._logout_and_restart_wait(7 * 60)
-                            return []
-                    except LangDetectException:
-                        pass
             except Exception:
                 continue
         return messages
@@ -824,7 +799,7 @@ class ChatHomeBaseAdapter:
             
             # 4. Type the message using human-like typing
             log("INFO", f"Typing {len(text)} chars...")
-            await box.type(text, delay=random.randint(30, 70)) # Typing with a small delay for realism
+            await self.typer.type(text) # Typing with a small delay for realism
             
             # 5. Send the message
             await asyncio.sleep(0.5)

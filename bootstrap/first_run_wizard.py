@@ -41,7 +41,7 @@ def run_wizard(config_file: Path):
 
     console.rule("[bold]ChatHomeBase credentials[/bold]")
     chb_email = Prompt.ask("ChatHomeBase email", default=existing.get("chathomebase_login", "")).strip()
-    chb_password = Prompt.ask("ChatHomeBase password (blank = keep current)", password=True, default="").strip()
+    chb_password = Prompt.ask("ChatHomeBase password (blank = keep current)", password=False, default="").strip()
     if not chb_password:
         chb_password = existing.get("chathomebase_password", "")
 
